@@ -426,49 +426,46 @@ async fn token(State(st): State<AppState>, headers: HeaderMap) -> Response {
     }
 
     // VC entitlement path.
-    if let Some(vc) = headers.get("x-vc-jwt").and_then(|h| h.to_str().ok()) {
-        if decode_vc(&st, vc).is_ok() {
-            return (
-                StatusCode::OK,
-                Json(issue_capability_jwt(&st, pop_pk_b64.clone())),
-            )
-                .into_response();
-        }
+    if let Some(vc) = headers.get("x-vc-jwt").and_then(|h| h.to_str().ok())
+        && decode_vc(&st, vc).is_ok()
+    {
+        return (
+            StatusCode::OK,
+            Json(issue_capability_jwt(&st, pop_pk_b64.clone())),
+        )
+            .into_response();
     }
 
     // Accept either x402 proof or l402 macaroon/preimage for the demo.
     // Preferred: Authorization schemes (more standard).
     if let Some(authz) = headers.get("authorization").and_then(|h| h.to_str().ok()) {
-        if let Some(proof) = authz.strip_prefix("X402 ") {
-            if let Ok(tok) = issue_token_after_x402(&st, proof, pop_pk_b64.as_deref()).await {
-                return (StatusCode::OK, Json(tok)).into_response();
-            }
-        }
+        if let Some(proof) = authz.strip_prefix("X402 ")
+            && let Ok(tok) = issue_token_after_x402(&st, proof, pop_pk_b64.as_deref()).await
+        {
+            return (StatusCode::OK, Json(tok)).into_response();
+        };
 
-        if let Some(rest) = authz.strip_prefix("L402 ") {
-            if let Some((mac, pre)) = rest.split_once(':') {
-                if let Ok(tok) = issue_token_after_l402(&st, mac, pre, pop_pk_b64.as_deref()).await
-                {
-                    return (StatusCode::OK, Json(tok)).into_response();
-                }
-            }
+        if let Some(rest) = authz.strip_prefix("L402 ")
+            && let Some((mac, pre)) = rest.split_once(':')
+            && let Ok(tok) = issue_token_after_l402(&st, mac, pre, pop_pk_b64.as_deref()).await
+        {
+            return (StatusCode::OK, Json(tok)).into_response();
         }
     }
 
     // Backwards compatible headers.
-    if let Some(proof) = headers.get("x-payment-proof").and_then(|h| h.to_str().ok()) {
-        if let Ok(tok) = issue_token_after_x402(&st, proof, pop_pk_b64.as_deref()).await {
-            return (StatusCode::OK, Json(tok)).into_response();
-        }
+    if let Some(proof) = headers.get("x-payment-proof").and_then(|h| h.to_str().ok())
+        && let Ok(tok) = issue_token_after_x402(&st, proof, pop_pk_b64.as_deref()).await
+    {
+        return (StatusCode::OK, Json(tok)).into_response();
     }
 
     if let (Some(mac), Some(pre)) = (
         headers.get("x-l402-macaroon").and_then(|h| h.to_str().ok()),
         headers.get("x-l402-preimage").and_then(|h| h.to_str().ok()),
-    ) {
-        if let Ok(tok) = issue_token_after_l402(&st, mac, pre, pop_pk_b64.as_deref()).await {
-            return (StatusCode::OK, Json(tok)).into_response();
-        }
+    ) && let Ok(tok) = issue_token_after_l402(&st, mac, pre, pop_pk_b64.as_deref()).await
+    {
+        return (StatusCode::OK, Json(tok)).into_response();
     }
 
     // No valid proof: challenge with x402 by default. Clients can request l402 via header.
