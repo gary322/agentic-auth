@@ -5,6 +5,9 @@
 //! - software backend stores private material only in `briefcase-secrets`
 //! - future backends (TPM/HSM/Secure Enclave) can keep keys non-exportable
 
+#[cfg(feature = "pkcs11")]
+pub mod pkcs11;
+
 use std::sync::Arc;
 
 use anyhow::Context as _;

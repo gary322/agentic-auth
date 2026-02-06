@@ -38,3 +38,7 @@ gen:
     echo "gen: skipped (no package.json)"; \
   fi
 
+# PKCS#11 / SoftHSM integration tests (Linux container).
+test-pkcs11:
+  docker build -f docker/softhsm/Dockerfile -t credential-briefcase-softhsm .
+  docker run --rm -v {{invocation_directory()}}:/workspace -w /workspace credential-briefcase-softhsm bash docker/softhsm/run-tests.sh

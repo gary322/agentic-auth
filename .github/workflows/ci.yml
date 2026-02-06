@@ -56,3 +56,15 @@ jobs:
 
       - name: Cargo test
         run: cargo test --all
+
+  pkcs11:
+    name: pkcs11 (SoftHSM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build SoftHSM test image
+        run: docker build -f docker/softhsm/Dockerfile -t credential-briefcase-softhsm .
+
+      - name: Run PKCS#11 tests (SoftHSM)
+        run: docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace credential-briefcase-softhsm bash docker/softhsm/run-tests.sh

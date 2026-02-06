@@ -131,7 +131,7 @@ For each task, include:
   - **Verify**: `cargo test -p briefcase-keys`
   - _Reqs: FR-6_
 
-- [ ] 4.2 Implement PKCS#11 backend (+ SoftHSM CI)
+- [x] 4.2 Implement PKCS#11 backend (+ SoftHSM CI)
   - **Do**: add PKCS#11 signer; dockerized SoftHSM integration tests.
   - **Files**: `crates/briefcase-keys/src/pkcs11.rs`, `docker/softhsm/*`, `.github/workflows/*`
   - **Done when**: CI can run sign/verify with SoftHSM.
