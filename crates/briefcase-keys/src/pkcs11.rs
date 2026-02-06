@@ -399,10 +399,10 @@ fn open_user_session(
 
 fn find_slot_by_label(pkcs11: &Pkcs11, token_label: &str) -> anyhow::Result<cryptoki::slot::Slot> {
     for slot in pkcs11.get_slots_with_token().context("list slots")? {
-        if let Ok(info) = pkcs11.get_token_info(slot) {
-            if info.label() == token_label {
-                return Ok(slot);
-            }
+        if let Ok(info) = pkcs11.get_token_info(slot)
+            && info.label() == token_label
+        {
+            return Ok(slot);
         }
     }
     anyhow::bail!("no PKCS#11 slot with token label {token_label:?}")
