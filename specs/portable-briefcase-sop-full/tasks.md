@@ -22,25 +22,25 @@ For each task, include:
 
 ## Phase 0: Monorepo Readiness For Multi-Platform Apps
 
-- [ ] 0.1 Add unified task runner + versioning conventions
+- [x] 0.1 Add unified task runner + versioning conventions
   - **Do**: introduce `justfile` (or `taskfile.yml`) for cross-language commands; define versioning strategy for Rust + extension + mobile + control plane.
   - **Files**: `justfile`, `docs/RELEASING.md`, `Cargo.toml`
   - **Done when**: `just ci` runs fmt/clippy/tests for Rust and placeholder steps for other components.
   - **Verify**: `just ci`
 
-- [ ] 0.2 Add Node workspace for extension/control-plane UI
+- [x] 0.2 Add Node workspace for extension/control-plane UI
   - **Do**: add `package.json`, `pnpm-workspace.yaml`, `apps/briefcase-extension/`, `apps/control-plane-ui/` (optional), lint/test skeleton.
   - **Files**: `package.json`, `pnpm-workspace.yaml`, `apps/briefcase-extension/*`
   - **Done when**: CI can run `pnpm -r lint` and `pnpm -r test` (even if minimal).
   - **Verify**: `corepack enable && pnpm -r lint && pnpm -r test`
 
-- [ ] 0.3 Add OpenAPI for daemon admin API + generated clients
+- [x] 0.3 Add OpenAPI for daemon admin API + generated clients
   - **Do**: define `openapi/briefcased.yaml` and generate TS client for extension and optional mobile.
   - **Files**: `openapi/briefcased.yaml`, `apps/briefcase-extension/src/gen/*`, `crates/briefcase-api/*`
   - **Done when**: API schema is source-of-truth and generation is deterministic.
   - **Verify**: `just gen && git diff --exit-code`
 
-- [ ] 0.4 Quality checkpoint
+- [x] 0.4 Quality checkpoint
   - **Verify**: `cargo fmt --check` + `cargo clippy --all-targets --all-features -- -D warnings` + `cargo test --all`
 
 ## Phase 1: Full MCP Compliance + Remote MCP Routing

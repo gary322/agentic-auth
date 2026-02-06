@@ -14,6 +14,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "pnpm"
+
+      - name: Install pnpm
+        shell: bash
+        run: corepack enable
+
+      - name: pnpm install
+        shell: bash
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate OpenAPI clients (must be committed)
+        shell: bash
+        run: |
+          pnpm -r gen
+          git diff --exit-code
+
+      - name: pnpm lint
+        shell: bash
+        run: pnpm -r lint
+
+      - name: pnpm test
+        shell: bash
+        run: pnpm -r test
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:

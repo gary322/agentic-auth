@@ -1,0 +1,19 @@
+{
+  "name": "@credential-briefcase/briefcase-extension",
+  "private": true,
+  "version": "0.1.4",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "gen": "openapi-typescript ../../openapi/briefcased.yaml -o src/gen/briefcased.ts",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "openapi-typescript": "^6.7.6",
+    "typescript": "^5.4.5",
+    "vitest": "^1.6.0"
+  }
+}
+

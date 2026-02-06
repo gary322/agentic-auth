@@ -1,0 +1,770 @@
+openapi: 3.1.0
+info:
+  title: Credential Briefcase Daemon API
+  version: 0.1.4
+  description: |
+    Local admin API for `briefcased`.
+
+    Security model:
+    - `/health` is unauthenticated.
+    - all `/v1/*` endpoints require `Authorization: Bearer <daemon_token>`.
+
+servers:
+  - url: http://127.0.0.1:0
+    description: Local daemon (TCP mode, ephemeral port)
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+
+    HealthResponse:
+      type: object
+      required: [status, ts]
+      properties:
+        status:
+          type: string
+        ts:
+          type: string
+          format: date-time
+
+    IdentityResponse:
+      type: object
+      required: [did]
+      properties:
+        did:
+          type: string
+
+    ProviderSummary:
+      type: object
+      required: [id, base_url, has_oauth_refresh, has_vc, vc_expires_at_rfc3339]
+      properties:
+        id:
+          type: string
+        base_url:
+          type: string
+        has_oauth_refresh:
+          type: boolean
+        has_vc:
+          type: boolean
+        vc_expires_at_rfc3339:
+          type: ["string", "null"]
+
+    ListProvidersResponse:
+      type: object
+      required: [providers]
+      properties:
+        providers:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProviderSummary"
+
+    UpsertProviderRequest:
+      type: object
+      required: [base_url]
+      properties:
+        base_url:
+          type: string
+
+    DeleteProviderResponse:
+      type: object
+      required: [provider_id]
+      properties:
+        provider_id:
+          type: string
+
+    OAuthExchangeRequest:
+      type: object
+      required: [code, redirect_uri, client_id, code_verifier]
+      properties:
+        code:
+          type: string
+        redirect_uri:
+          type: string
+        client_id:
+          type: string
+        code_verifier:
+          type: string
+
+    OAuthExchangeResponse:
+      type: object
+      required: [provider_id]
+      properties:
+        provider_id:
+          type: string
+
+    FetchVcResponse:
+      type: object
+      required: [provider_id, expires_at_rfc3339]
+      properties:
+        provider_id:
+          type: string
+        expires_at_rfc3339:
+          type: string
+          format: date-time
+
+    VerifyReceiptsResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+
+    BudgetRecord:
+      type: object
+      required: [category, daily_limit_microusd]
+      properties:
+        category:
+          type: string
+        daily_limit_microusd:
+          type: integer
+          format: int64
+
+    ListBudgetsResponse:
+      type: object
+      required: [budgets]
+      properties:
+        budgets:
+          type: array
+          items:
+            $ref: "#/components/schemas/BudgetRecord"
+
+    SetBudgetRequest:
+      type: object
+      required: [daily_limit_microusd]
+      properties:
+        daily_limit_microusd:
+          type: integer
+          format: int64
+
+    ToolCategory:
+      description: |
+        Matches `briefcase_core::ToolCategory`.
+        Most tools use string categories `read|write|admin`.
+      oneOf:
+        - type: string
+          enum: [read, write, admin]
+        - type: object
+          required: [other]
+          properties:
+            other:
+              type: string
+
+    ToolCost:
+      type: object
+      required: [estimated_usd]
+      properties:
+        estimated_usd:
+          type: number
+
+    OutputFirewallMode:
+      type: string
+      enum: [allow_all, allow_paths]
+
+    OutputFirewall:
+      type: object
+      required: [mode, allowed_paths]
+      properties:
+        mode:
+          $ref: "#/components/schemas/OutputFirewallMode"
+        allowed_paths:
+          type: array
+          items:
+            type: string
+
+    ToolSpec:
+      type: object
+      required:
+        - id
+        - name
+        - description
+        - input_schema
+        - output_schema
+        - category
+        - cost
+        - output_firewall
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        input_schema: {}
+        output_schema: {}
+        category:
+          $ref: "#/components/schemas/ToolCategory"
+        cost:
+          $ref: "#/components/schemas/ToolCost"
+        output_firewall:
+          $ref: "#/components/schemas/OutputFirewall"
+
+    ListToolsResponse:
+      type: object
+      required: [tools]
+      properties:
+        tools:
+          type: array
+          items:
+            $ref: "#/components/schemas/ToolSpec"
+
+    ToolCallContext:
+      type: object
+      required: [request_id, agent_id, session_id]
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        agent_id:
+          type: ["string", "null"]
+        session_id:
+          type: ["string", "null"]
+
+    ToolCall:
+      type: object
+      required: [tool_id, args, context, approval_token]
+      properties:
+        tool_id:
+          type: string
+        args: {}
+        context:
+          $ref: "#/components/schemas/ToolCallContext"
+        approval_token:
+          type: ["string", "null"]
+
+    CallToolRequest:
+      type: object
+      required: [call]
+      properties:
+        call:
+          $ref: "#/components/schemas/ToolCall"
+
+    Provenance:
+      type: object
+      required: [source, cost_usd, timestamp, receipt_id]
+      properties:
+        source:
+          type: string
+        cost_usd:
+          type: ["number", "null"]
+        timestamp:
+          type: string
+          format: date-time
+        receipt_id:
+          type: integer
+          format: int64
+
+    ToolResult:
+      type: object
+      required: [content, provenance]
+      properties:
+        content: {}
+        provenance:
+          $ref: "#/components/schemas/Provenance"
+
+    ApprovalRequest:
+      type: object
+      required: [id, created_at, expires_at, tool_id, reason, summary]
+      properties:
+        id:
+          type: string
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        tool_id:
+          type: string
+        reason:
+          type: string
+        summary: {}
+
+    CallToolResponse:
+      description: Matches `briefcase_api::types::CallToolResponse`.
+      oneOf:
+        - type: object
+          required: [status, result]
+          properties:
+            status:
+              type: string
+              const: ok
+            result:
+              $ref: "#/components/schemas/ToolResult"
+        - type: object
+          required: [status, approval]
+          properties:
+            status:
+              type: string
+              const: approval_required
+            approval:
+              $ref: "#/components/schemas/ApprovalRequest"
+        - type: object
+          required: [status, reason]
+          properties:
+            status:
+              type: string
+              const: denied
+            reason:
+              type: string
+        - type: object
+          required: [status, message]
+          properties:
+            status:
+              type: string
+              const: error
+            message:
+              type: string
+
+    ListApprovalsResponse:
+      type: object
+      required: [approvals]
+      properties:
+        approvals:
+          type: array
+          items:
+            $ref: "#/components/schemas/ApprovalRequest"
+
+    ApproveResponse:
+      type: object
+      required: [approval_id, approval_token]
+      properties:
+        approval_id:
+          type: string
+          format: uuid
+        approval_token:
+          type: string
+
+    ReceiptRecord:
+      type: object
+      required: [id, ts, prev_hash_hex, hash_hex, event]
+      properties:
+        id:
+          type: integer
+          format: int64
+        ts:
+          type: string
+          format: date-time
+        prev_hash_hex:
+          type: string
+        hash_hex:
+          type: string
+        event: {}
+
+    ListReceiptsResponse:
+      type: object
+      required: [receipts]
+      properties:
+        receipts:
+          type: array
+          items:
+            $ref: "#/components/schemas/ReceiptRecord"
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      operationId: health
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /v1/identity:
+    get:
+      summary: Get holder identity DID
+      operationId: getIdentity
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdentityResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/providers:
+    get:
+      summary: List providers
+      operationId: listProviders
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListProvidersResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/providers/{id}:
+    post:
+      summary: Upsert provider
+      operationId: upsertProvider
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpsertProviderRequest"
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderSummary"
+        "400":
+          description: bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/providers/{id}/delete:
+    post:
+      summary: Delete provider
+      operationId: deleteProvider
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteProviderResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/providers/{id}/oauth/exchange:
+    post:
+      summary: Exchange OAuth authorization code for refresh token (stored in daemon)
+      operationId: oauthExchange
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OAuthExchangeRequest"
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthExchangeResponse"
+        "400":
+          description: bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/providers/{id}/vc/fetch:
+    post:
+      summary: Fetch VC entitlement from provider gateway (stored in daemon)
+      operationId: fetchVc
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FetchVcResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/budgets:
+    get:
+      summary: List budgets
+      operationId: listBudgets
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListBudgetsResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/budgets/{category}:
+    post:
+      summary: Set daily budget for a category (micro-USD)
+      operationId: setBudget
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: category
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetBudgetRequest"
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BudgetRecord"
+        "400":
+          description: bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/tools:
+    get:
+      summary: List tools
+      operationId: listTools
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListToolsResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/tools/call:
+    post:
+      summary: Execute a tool call (policy/budget/approvals enforced)
+      operationId: callTool
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CallToolRequest"
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CallToolResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CallToolResponse"
+
+  /v1/approvals:
+    get:
+      summary: List pending approvals
+      operationId: listApprovals
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListApprovalsResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/approvals/{id}/approve:
+    post:
+      summary: Approve a pending request (returns approval token)
+      operationId: approve
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApproveResponse"
+        "400":
+          description: bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/receipts:
+    get:
+      summary: List receipts
+      operationId: listReceipts
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListReceiptsResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/receipts/verify:
+    post:
+      summary: Verify the receipt chain
+      operationId: verifyReceipts
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VerifyReceiptsResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
