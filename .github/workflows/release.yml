@@ -80,7 +80,7 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          find . -type f \\( -name '*.tar.gz' -o -name '*.zip' \\) -print0 | xargs -0 sha256sum > SHA256SUMS.txt
+          find . -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 | xargs -0 sha256sum > SHA256SUMS.txt
 
       - name: Sign artifacts (keyless)
         shell: bash
@@ -89,7 +89,7 @@ jobs:
           cd dist
           while IFS= read -r f; do
             cosign sign-blob --yes --output-signature "${f}.sig" --output-certificate "${f}.crt" "${f}"
-          done < <(find . -type f \\( -name '*.tar.gz' -o -name '*.zip' \\) -print)
+          done < <(find . -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print)
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
