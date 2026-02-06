@@ -20,7 +20,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.89.0"
 
       - name: Cargo audit
         uses: rustsec/audit-check@v2
