@@ -260,10 +260,12 @@ impl ProviderClient {
     ) -> anyhow::Result<CachedToken> {
         {
             let guard = self.cached.lock().await;
-            if let Some(c) = guard.get(provider_id) {
-                if c.base_url == base_url && Utc::now() < c.expires_at && c.remaining_calls > 0 {
-                    return Ok(c.clone());
-                }
+            if let Some(c) = guard.get(provider_id)
+                && c.base_url == base_url
+                && Utc::now() < c.expires_at
+                && c.remaining_calls > 0
+            {
+                return Ok(c.clone());
             }
         }
 
@@ -278,12 +280,11 @@ impl ProviderClient {
     async fn fetch_token(&self, provider_id: &str, base_url: &str) -> anyhow::Result<CachedToken> {
         // Auth strategy selection order (per sop.txt):
         // VC entitlement > OAuth refresh token > micropayment fallback.
-        if let Some((vc_jwt, expires_at)) = self.db.get_vc(provider_id).await? {
-            if Utc::now() < expires_at {
-                if let Ok(tok) = self.fetch_token_via_vc(base_url, &vc_jwt).await {
-                    return Ok(tok);
-                }
-            }
+        if let Some((vc_jwt, expires_at)) = self.db.get_vc(provider_id).await?
+            && Utc::now() < expires_at
+            && let Ok(tok) = self.fetch_token_via_vc(base_url, &vc_jwt).await
+        {
+            return Ok(tok);
         }
 
         if let Some(rt) = self.load_oauth_refresh_token(provider_id).await? {

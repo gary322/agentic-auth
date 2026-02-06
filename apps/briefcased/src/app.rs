@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::path::Path;
+#[cfg(unix)]
 use std::path::PathBuf;
 
 use anyhow::Context as _;
@@ -72,19 +73,19 @@ impl AppState {
             }
             None => None,
         };
-        if let Some(u) = &classifier_url {
-            if u.scheme() == "http" {
-                let host = u.host().context("classifier url missing host")?;
-                let is_loopback = match host {
-                    url::Host::Domain(d) => d.eq_ignore_ascii_case("localhost"),
-                    url::Host::Ipv4(ip) => ip.is_loopback(),
-                    url::Host::Ipv6(ip) => ip.is_loopback(),
-                };
-                if !is_loopback {
-                    anyhow::bail!(
-                        "BRIEFCASE_RISK_CLASSIFIER_URL must use https (or http to localhost)"
-                    );
-                }
+        if let Some(u) = &classifier_url
+            && u.scheme() == "http"
+        {
+            let host = u.host().context("classifier url missing host")?;
+            let is_loopback = match host {
+                url::Host::Domain(d) => d.eq_ignore_ascii_case("localhost"),
+                url::Host::Ipv4(ip) => ip.is_loopback(),
+                url::Host::Ipv6(ip) => ip.is_loopback(),
+            };
+            if !is_loopback {
+                anyhow::bail!(
+                    "BRIEFCASE_RISK_CLASSIFIER_URL must use https (or http to localhost)"
+                );
             }
         }
         let risk = Arc::new(briefcase_risk::RiskEngine::new(classifier_url)?);
