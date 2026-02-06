@@ -17,4 +17,13 @@ TCTI="swtpm:port=2321"
 export TPM2TOOLS_TCTI="${TCTI}"
 export BRIEFCASE_TPM2_TCTI="${TCTI}"
 
+# swtpm can take a moment to accept connections in CI; block until tpm2-tools can talk to it.
+for _ in $(seq 1 50); do
+  if tpm2_getcap properties-fixed >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.1
+done
+tpm2_getcap properties-fixed >/dev/null
+
 cargo test -p briefcase-keys --features tpm2
