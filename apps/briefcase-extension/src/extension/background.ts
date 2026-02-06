@@ -66,7 +66,16 @@ async function connectOAuth(server_id: string, scope?: string): Promise<void> {
   await nativeCall("mcp_oauth_exchange", { server_id, code, state });
 }
 
-chrome.runtime.onMessage.addListener((msg: unknown, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg: unknown, sender, sendResponse) => {
+  // Only accept messages from our own popup UI. This reduces the blast radius if a
+  // content script is ever added in the future.
+  const popupUrl = chrome.runtime.getURL("popup.html");
+  const senderUrlOk = sender.url ? sender.url.startsWith(popupUrl) : true;
+  if (sender.id !== chrome.runtime.id || !senderUrlOk) {
+    sendResponse({ ok: false, error: "sender_not_allowed" } satisfies PopupResponse);
+    return false;
+  }
+
   const req = msg as PopupRequest;
 
   (async () => {

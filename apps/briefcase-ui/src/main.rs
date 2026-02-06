@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use axum::extract::{Path as AxumPath, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode, header::HOST, uri::Authority};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -102,12 +103,46 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/approvals/{id}/approve", post(api_approve))
         .route("/api/receipts", get(api_receipts))
         .layer(TraceLayer::new_for_http())
+        // DNS rebinding defense: if a hostile site can cause a browser to treat it as the UI
+        // origin (by rebinding to 127.0.0.1), they could read the CSRF token and issue writes.
+        .layer(middleware::from_fn(enforce_ui_host_allowlist))
         .with_state(st);
 
     info!(addr = %args.ui_addr, "briefcase-ui listening");
     let listener = tokio::net::TcpListener::bind(args.ui_addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn enforce_ui_host_allowlist(req: Request<axum::body::Body>, next: Next) -> Response {
+    // Only accept loopback hosts. If a DNS rebinding attack points a hostname at 127.0.0.1,
+    // the browser's Host header would still be the attacker-controlled name and will be rejected.
+    let host = req
+        .headers()
+        .get(HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+
+    if !is_allowed_ui_host(host) {
+        return (StatusCode::BAD_REQUEST, "invalid_host").into_response();
+    }
+
+    next.run(req).await
+}
+
+fn is_allowed_ui_host(host: &str) -> bool {
+    let auth: Authority = match host.parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+
+    // Tolerate `localhost.` from some resolvers, and accept bracketed IPv6 literals.
+    let h = auth
+        .host()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+    h.eq_ignore_ascii_case("localhost") || h == "127.0.0.1" || h == "::1"
 }
 
 async fn index(State(st): State<AppState>) -> Html<String> {
@@ -485,4 +520,53 @@ fn random_token_b64url(nbytes: usize) -> String {
     let mut buf = vec![0u8; nbytes];
     rand::rng().fill_bytes(&mut buf);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::routing::get;
+    use tower::ServiceExt as _;
+
+    #[tokio::test]
+    async fn ui_host_allowlist_denies_non_loopback_host() -> anyhow::Result<()> {
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(middleware::from_fn(enforce_ui_host_allowlist));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("http://example.invalid/")
+                    .header(HOST, "evil.example")
+                    .body(Body::empty())?,
+            )
+            .await?;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ui_host_allowlist_allows_loopback_hosts() -> anyhow::Result<()> {
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(middleware::from_fn(enforce_ui_host_allowlist));
+
+        for h in ["localhost:8787", "127.0.0.1:8787", "[::1]:8787"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("http://example.invalid/")
+                        .header(HOST, h)
+                        .body(Body::empty())?,
+                )
+                .await?;
+            assert_eq!(resp.status(), StatusCode::OK, "host={h}");
+        }
+
+        Ok(())
+    }
 }

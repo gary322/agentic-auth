@@ -175,7 +175,7 @@ For each task, include:
   - **Done when**: approvals can be approved from the extension; receipts are viewable and exportable.
   - **Verify**: Playwright e2e extension tests.
 
-- [ ] 5.3 Extension security hardening
+- [x] 5.3 Extension security hardening
   - **Do**: content security policy, permissions minimization, anti-DNS rebinding checks, signed messages to host.
   - **Files**: `apps/briefcase-extension/manifest.json`, `apps/native-messaging-host/*`
   - **Done when**: security review checklist passes and automated tests cover critical invariants.

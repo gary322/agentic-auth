@@ -22,3 +22,5 @@ uuid.workspace = true
 
 briefcase-api = { path = "../../crates/briefcase-api" }
 
+[dev-dependencies]
+tower.workspace = true

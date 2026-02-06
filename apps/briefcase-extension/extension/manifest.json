@@ -3,7 +3,10 @@
   "name": "Credential Briefcase",
   "version": "0.1.4",
   "description": "Local credential briefcase onboarding and approvals for AI tools (no raw secrets in the agent boundary).",
-  "permissions": ["nativeMessaging", "identity", "storage"],
+  "permissions": ["nativeMessaging", "identity"],
+  "content_security_policy": {
+    "extension_pages": "default-src 'self'; script-src 'self'; object-src 'self'; base-uri 'none'; frame-ancestors 'none'"
+  },
   "action": {
     "default_title": "Credential Briefcase",
     "default_popup": "popup.html"
@@ -13,4 +16,3 @@
     "type": "module"
   }
 }
-
