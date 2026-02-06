@@ -464,6 +464,10 @@ async fn start_mcp_oauth(
         .map_err(internal_error)?;
 
     // Persist discovery results for refresh usage.
+    let dpop_algs = d
+        .dpop_signing_alg_values_supported
+        .clone()
+        .unwrap_or_default();
     state
         .db
         .upsert_remote_mcp_oauth(
@@ -472,6 +476,7 @@ async fn start_mcp_oauth(
             d.authorization_endpoint.as_str(),
             d.token_endpoint.as_str(),
             d.resource.as_str(),
+            &dpop_algs,
         )
         .await
         .map_err(internal_error)?;
@@ -574,18 +579,90 @@ async fn exchange_mcp_oauth(
         .build()
         .map_err(internal_error)?;
 
-    let resp = http
-        .post(sess.token_endpoint.as_str())
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", req.code.as_str()),
-            ("redirect_uri", sess.redirect_uri.as_str()),
-            ("client_id", sess.client_id.as_str()),
-            ("code_verifier", sess.code_verifier.as_str()),
-        ])
-        .send()
+    let mut reqb = http.post(sess.token_endpoint.as_str()).form(&[
+        ("grant_type", "authorization_code"),
+        ("code", req.code.as_str()),
+        ("redirect_uri", sess.redirect_uri.as_str()),
+        ("client_id", sess.client_id.as_str()),
+        ("code_verifier", sess.code_verifier.as_str()),
+    ]);
+
+    // If the auth server supports DPoP, bind this token exchange to a per-server PoP key.
+    if let Some(meta) = state
+        .db
+        .get_remote_mcp_oauth(&id)
         .await
-        .map_err(internal_error)?;
+        .map_err(internal_error)?
+        && !meta.dpop_signing_alg_values_supported.is_empty()
+    {
+        let want_alg = if meta
+            .dpop_signing_alg_values_supported
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case("EdDSA"))
+        {
+            Some(KeyAlgorithm::Ed25519)
+        } else if meta
+            .dpop_signing_alg_values_supported
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case("ES256"))
+        {
+            Some(KeyAlgorithm::P256)
+        } else {
+            None
+        };
+
+        if let Some(want_alg) = want_alg {
+            let keys = SoftwareKeyManager::new(state.secrets.clone());
+            let handle_key = format!("oauth.mcp.{id}.dpop_key_handle");
+            let signer = match state
+                .secrets
+                .get(&handle_key)
+                .await
+                .map_err(internal_error)?
+            {
+                Some(raw) => {
+                    let h = KeyHandle::from_json(&raw.into_inner()).map_err(internal_error)?;
+                    if h.algorithm != want_alg {
+                        let _ = keys.delete(&h).await;
+                        let h2 = keys.generate(want_alg).await.map_err(internal_error)?;
+                        state
+                            .secrets
+                            .put(
+                                &handle_key,
+                                briefcase_core::Sensitive(h2.to_json().map_err(internal_error)?),
+                            )
+                            .await
+                            .map_err(internal_error)?;
+                        keys.signer(h2)
+                    } else {
+                        keys.signer(h)
+                    }
+                }
+                None => {
+                    let h = keys.generate(want_alg).await.map_err(internal_error)?;
+                    state
+                        .secrets
+                        .put(
+                            &handle_key,
+                            briefcase_core::Sensitive(h.to_json().map_err(internal_error)?),
+                        )
+                        .await
+                        .map_err(internal_error)?;
+                    keys.signer(h)
+                }
+            };
+
+            let token_endpoint_url =
+                url::Url::parse(sess.token_endpoint.as_str()).map_err(internal_error)?;
+            let proof =
+                crate::dpop::dpop_proof_for_token_endpoint(signer.as_ref(), &token_endpoint_url)
+                    .await
+                    .map_err(internal_error)?;
+            reqb = reqb.header("DPoP", proof);
+        }
+    }
+
+    let resp = reqb.send().await.map_err(internal_error)?;
 
     if !resp.status().is_success() {
         return Err(bad_request("oauth_exchange_failed"));
@@ -1523,6 +1600,9 @@ mod tests {
     #[derive(Clone)]
     struct MockOAuthMcpState {
         token_calls: Arc<tokio::sync::Mutex<u64>>,
+        token_ok_calls: Arc<tokio::sync::Mutex<u64>>,
+        mcp_calls: Arc<tokio::sync::Mutex<u64>>,
+        mcp_ok_calls: Arc<tokio::sync::Mutex<u64>>,
     }
 
     async fn start_mock_oauth_protected_mcp()
@@ -1543,6 +1623,9 @@ mod tests {
         struct MockServer {
             addr: SocketAddr,
             token_calls: Arc<tokio::sync::Mutex<u64>>,
+            token_ok_calls: Arc<tokio::sync::Mutex<u64>>,
+            mcp_calls: Arc<tokio::sync::Mutex<u64>>,
+            mcp_ok_calls: Arc<tokio::sync::Mutex<u64>>,
             conn: Arc<tokio::sync::Mutex<McpConnection>>,
         }
 
@@ -1641,6 +1724,7 @@ mod tests {
                             Json(serde_json::json!({"error":"invalid_request"})),
                         );
                     }
+                    *st.token_ok_calls.lock().await += 1;
                     (
                         StatusCode::OK,
                         Json(serde_json::json!({
@@ -1658,6 +1742,7 @@ mod tests {
                             Json(serde_json::json!({"error":"invalid_grant"})),
                         );
                     }
+                    *st.token_ok_calls.lock().await += 1;
                     (
                         StatusCode::OK,
                         Json(serde_json::json!({
@@ -1679,6 +1764,7 @@ mod tests {
             headers: HeaderMap,
             body: Bytes,
         ) -> impl IntoResponse {
+            *st.mcp_calls.lock().await += 1;
             let ok = headers
                 .get("authorization")
                 .and_then(|h| h.to_str().ok())
@@ -1687,6 +1773,7 @@ mod tests {
             if !ok {
                 return StatusCode::UNAUTHORIZED.into_response();
             }
+            *st.mcp_ok_calls.lock().await += 1;
 
             let msg: JsonRpcMessage = match serde_json::from_slice(&body) {
                 Ok(m) => m,
@@ -1704,6 +1791,9 @@ mod tests {
         let addr = listener.local_addr()?;
 
         let token_calls = Arc::new(tokio::sync::Mutex::new(0));
+        let token_ok_calls = Arc::new(tokio::sync::Mutex::new(0));
+        let mcp_calls = Arc::new(tokio::sync::Mutex::new(0));
+        let mcp_ok_calls = Arc::new(tokio::sync::Mutex::new(0));
         let handler = Arc::new(Handler);
         let cfg = McpServerConfig::default_for_binary("mock-oauth-mcp", "0.0.0");
         let conn = Arc::new(tokio::sync::Mutex::new(McpConnection::new(cfg, handler)));
@@ -1715,6 +1805,9 @@ mod tests {
             .with_state(MockServer {
                 addr,
                 token_calls: token_calls.clone(),
+                token_ok_calls: token_ok_calls.clone(),
+                mcp_calls: mcp_calls.clone(),
+                mcp_ok_calls: mcp_ok_calls.clone(),
                 conn,
             });
 
@@ -1722,7 +1815,422 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        Ok((addr, MockOAuthMcpState { token_calls }, handle))
+        Ok((
+            addr,
+            MockOAuthMcpState {
+                token_calls,
+                token_ok_calls,
+                mcp_calls,
+                mcp_ok_calls,
+            },
+            handle,
+        ))
+    }
+
+    async fn start_mock_oauth_dpop_protected_mcp()
+    -> anyhow::Result<(SocketAddr, MockOAuthMcpState, tokio::task::JoinHandle<()>)> {
+        use axum::body::Bytes;
+        use axum::extract::{Form, State as AxumState};
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::response::IntoResponse;
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+        use base64::Engine as _;
+        use briefcase_mcp::{
+            CallToolParams, CallToolResult, ContentBlock, JsonRpcMessage, ListToolsParams,
+            ListToolsResult, McpConnection, McpHandler, McpServerConfig, Tool,
+        };
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        use sha2::Digest as _;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        fn decode_b64url(s: &str) -> Option<Vec<u8>> {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(s)
+                .ok()
+        }
+
+        fn sha256_b64url(msg: &[u8]) -> String {
+            let digest = sha2::Sha256::digest(msg);
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+        }
+
+        fn verify_dpop(
+            jwt: &str,
+            method: &str,
+            url: &str,
+            access_token: Option<&str>,
+            expected_jwk: Option<&serde_json::Value>,
+            used_jtis: &mut HashMap<String, i64>,
+        ) -> Result<serde_json::Value, StatusCode> {
+            let parts: Vec<&str> = jwt.split('.').collect();
+            if parts.len() != 3 {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            let header_bytes = decode_b64url(parts[0]).ok_or(StatusCode::UNAUTHORIZED)?;
+            let payload_bytes = decode_b64url(parts[1]).ok_or(StatusCode::UNAUTHORIZED)?;
+            let sig_bytes = decode_b64url(parts[2]).ok_or(StatusCode::UNAUTHORIZED)?;
+
+            let header: serde_json::Value =
+                serde_json::from_slice(&header_bytes).map_err(|_| StatusCode::UNAUTHORIZED)?;
+            let payload: serde_json::Value =
+                serde_json::from_slice(&payload_bytes).map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+            let typ = header
+                .get("typ")
+                .and_then(|v| v.as_str())
+                .ok_or(StatusCode::UNAUTHORIZED)?;
+            if typ != "dpop+jwt" {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            let alg = header
+                .get("alg")
+                .and_then(|v| v.as_str())
+                .ok_or(StatusCode::UNAUTHORIZED)?;
+            if alg != "EdDSA" {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            let jwk = header.get("jwk").cloned().ok_or(StatusCode::UNAUTHORIZED)?;
+
+            if let Some(exp) = expected_jwk {
+                if &jwk != exp {
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+            }
+
+            let htu = payload
+                .get("htu")
+                .and_then(|v| v.as_str())
+                .ok_or(StatusCode::UNAUTHORIZED)?;
+            let htm = payload
+                .get("htm")
+                .and_then(|v| v.as_str())
+                .ok_or(StatusCode::UNAUTHORIZED)?;
+            if htu != url || !htm.eq_ignore_ascii_case(method) {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+
+            let iat = payload
+                .get("iat")
+                .and_then(|v| v.as_i64())
+                .ok_or(StatusCode::UNAUTHORIZED)?;
+            let jti = payload
+                .get("jti")
+                .and_then(|v| v.as_str())
+                .ok_or(StatusCode::UNAUTHORIZED)?;
+            if jti.is_empty() || jti.len() > 128 {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+
+            let now = Utc::now().timestamp();
+            const MAX_SKEW_SECS: i64 = 120;
+            if (now - iat).abs() > MAX_SKEW_SECS {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+
+            // Optional access token hash binding.
+            if let Some(at) = access_token {
+                let ath = payload
+                    .get("ath")
+                    .and_then(|v| v.as_str())
+                    .ok_or(StatusCode::UNAUTHORIZED)?;
+                if ath != sha256_b64url(at.as_bytes()) {
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+            }
+
+            // Replay defense: jti must be unique (best-effort for the mock).
+            if used_jtis.contains_key(jti) {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            used_jtis.insert(jti.to_string(), iat);
+
+            let x_b64 = jwk
+                .get("x")
+                .and_then(|v| v.as_str())
+                .ok_or(StatusCode::UNAUTHORIZED)?;
+            let pk_bytes: [u8; 32] = decode_b64url(x_b64)
+                .ok_or(StatusCode::UNAUTHORIZED)?
+                .try_into()
+                .map_err(|_| StatusCode::UNAUTHORIZED)?;
+            let vk = VerifyingKey::from_bytes(&pk_bytes).map_err(|_| StatusCode::UNAUTHORIZED)?;
+            let sig_bytes: [u8; 64] = sig_bytes.try_into().map_err(|_| StatusCode::UNAUTHORIZED)?;
+            let sig = Signature::from_bytes(&sig_bytes);
+            let signing_input = format!("{}.{}", parts[0], parts[1]);
+            vk.verify(signing_input.as_bytes(), &sig)
+                .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+            Ok(jwk)
+        }
+
+        #[derive(Clone)]
+        struct MockServer {
+            addr: SocketAddr,
+            token_calls: Arc<tokio::sync::Mutex<u64>>,
+            token_ok_calls: Arc<tokio::sync::Mutex<u64>>,
+            mcp_calls: Arc<tokio::sync::Mutex<u64>>,
+            mcp_ok_calls: Arc<tokio::sync::Mutex<u64>>,
+            dpop_jwk: Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
+            used_jtis: Arc<tokio::sync::Mutex<HashMap<String, i64>>>,
+            conn: Arc<tokio::sync::Mutex<McpConnection>>,
+        }
+
+        #[derive(Clone)]
+        struct Handler;
+
+        #[async_trait::async_trait]
+        impl McpHandler for Handler {
+            async fn list_tools(
+                &self,
+                _params: ListToolsParams,
+            ) -> anyhow::Result<ListToolsResult> {
+                Ok(ListToolsResult {
+                    tools: vec![Tool {
+                        name: "hello".to_string(),
+                        title: Some("Remote Hello".to_string()),
+                        description: Some(
+                            "Returns the provided text (dpop protected).".to_string(),
+                        ),
+                        input_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "text": { "type": "string", "maxLength": 128 }
+                            },
+                            "required": ["text"],
+                            "additionalProperties": false
+                        }),
+                    }],
+                    next_cursor: None,
+                })
+            }
+
+            async fn call_tool(&self, params: CallToolParams) -> anyhow::Result<CallToolResult> {
+                if params.name != "hello" {
+                    anyhow::bail!("unknown tool");
+                }
+                let text = params
+                    .arguments
+                    .as_ref()
+                    .and_then(|v| v.get("text"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                Ok(CallToolResult {
+                    content: vec![ContentBlock::Text {
+                        text: format!("remote:{text}"),
+                    }],
+                    structured_content: None,
+                    is_error: None,
+                    meta: None,
+                })
+            }
+        }
+
+        async fn prm(AxumState(st): AxumState<MockServer>) -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "authorization_servers": [format!("http://{}/as", st.addr)],
+                "resource": format!("http://{}/mcp", st.addr),
+                "scopes_supported": ["mcp.read"]
+            }))
+        }
+
+        async fn as_meta(AxumState(st): AxumState<MockServer>) -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "issuer": format!("http://{}/as", st.addr),
+                "authorization_endpoint": format!("http://{}/as/authorize", st.addr),
+                "token_endpoint": format!("http://{}/as/token", st.addr),
+                "scopes_supported": ["mcp.read"],
+                "dpop_signing_alg_values_supported": ["EdDSA"]
+            }))
+        }
+
+        #[derive(Debug, serde::Deserialize)]
+        struct TokenForm {
+            grant_type: String,
+            refresh_token: Option<String>,
+            code: Option<String>,
+            redirect_uri: Option<String>,
+            client_id: Option<String>,
+            code_verifier: Option<String>,
+        }
+
+        async fn token(
+            AxumState(st): AxumState<MockServer>,
+            headers: HeaderMap,
+            Form(body): Form<TokenForm>,
+        ) -> (StatusCode, Json<serde_json::Value>) {
+            *st.token_calls.lock().await += 1;
+
+            let proof = headers
+                .get("dpop")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or_default();
+            if proof.is_empty() {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error":"missing_dpop"})),
+                );
+            }
+
+            let expected_url = format!("http://{}/as/token", st.addr);
+            let expected_jwk = st.dpop_jwk.lock().await.clone();
+            let mut used = st.used_jtis.lock().await;
+            let jwk = match verify_dpop(
+                proof,
+                "POST",
+                &expected_url,
+                None,
+                expected_jwk.as_ref(),
+                &mut used,
+            ) {
+                Ok(v) => v,
+                Err(sc) => {
+                    return (sc, Json(serde_json::json!({"error":"bad_dpop"})));
+                }
+            };
+            if expected_jwk.is_none() {
+                *st.dpop_jwk.lock().await = Some(jwk);
+            }
+
+            match body.grant_type.as_str() {
+                "authorization_code" => {
+                    if body.code.is_none()
+                        || body.redirect_uri.is_none()
+                        || body.client_id.is_none()
+                        || body.code_verifier.is_none()
+                    {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"error":"invalid_request"})),
+                        );
+                    }
+                    *st.token_ok_calls.lock().await += 1;
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "access_token": "at_code",
+                            "refresh_token": "rt_mcp",
+                            "token_type": "DPoP",
+                            "expires_in": 600
+                        })),
+                    )
+                }
+                "refresh_token" => {
+                    if body.refresh_token.as_deref() != Some("rt_mcp") {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"error":"invalid_grant"})),
+                        );
+                    }
+                    *st.token_ok_calls.lock().await += 1;
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "access_token": "at_mcp",
+                            "token_type": "DPoP",
+                            "expires_in": 600
+                        })),
+                    )
+                }
+                _ => (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":"unsupported_grant"})),
+                ),
+            }
+        }
+
+        async fn mcp(
+            AxumState(st): AxumState<MockServer>,
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> impl IntoResponse {
+            *st.mcp_calls.lock().await += 1;
+            let ok = headers
+                .get("authorization")
+                .and_then(|h| h.to_str().ok())
+                .map(|v| v == "DPoP at_mcp")
+                .unwrap_or(false);
+            if !ok {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+
+            let proof = headers
+                .get("dpop")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or_default();
+            if proof.is_empty() {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+
+            let expected_url = format!("http://{}/mcp", st.addr);
+            let expected_jwk = st.dpop_jwk.lock().await.clone();
+            let mut used = st.used_jtis.lock().await;
+            if verify_dpop(
+                proof,
+                "POST",
+                &expected_url,
+                Some("at_mcp"),
+                expected_jwk.as_ref(),
+                &mut used,
+            )
+            .is_err()
+            {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            *st.mcp_ok_calls.lock().await += 1;
+
+            let msg: JsonRpcMessage = match serde_json::from_slice(&body) {
+                Ok(m) => m,
+                Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+            };
+
+            let mut conn = st.conn.lock().await;
+            match conn.handle_message(msg).await {
+                Some(resp) => (StatusCode::OK, axum::Json(resp)).into_response(),
+                None => StatusCode::ACCEPTED.into_response(),
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+
+        let token_calls = Arc::new(tokio::sync::Mutex::new(0));
+        let token_ok_calls = Arc::new(tokio::sync::Mutex::new(0));
+        let mcp_calls = Arc::new(tokio::sync::Mutex::new(0));
+        let mcp_ok_calls = Arc::new(tokio::sync::Mutex::new(0));
+        let handler = Arc::new(Handler);
+        let cfg = McpServerConfig::default_for_binary("mock-oauth-dpop-mcp", "0.0.0");
+        let conn = Arc::new(tokio::sync::Mutex::new(McpConnection::new(cfg, handler)));
+        let app = Router::new()
+            .route("/.well-known/oauth-protected-resource", get(prm))
+            .route("/as/.well-known/oauth-authorization-server", get(as_meta))
+            .route("/as/token", post(token))
+            .route("/mcp", post(mcp))
+            .with_state(MockServer {
+                addr,
+                token_calls: token_calls.clone(),
+                token_ok_calls: token_ok_calls.clone(),
+                mcp_calls: mcp_calls.clone(),
+                mcp_ok_calls: mcp_ok_calls.clone(),
+                dpop_jwk: Arc::new(tokio::sync::Mutex::new(None)),
+                used_jtis: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                conn,
+            });
+
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        Ok((
+            addr,
+            MockOAuthMcpState {
+                token_calls,
+                token_ok_calls,
+                mcp_calls,
+                mcp_ok_calls,
+            },
+            handle,
+        ))
     }
 
     async fn start_mock_provider()
@@ -2469,6 +2977,97 @@ mod tests {
             .call_tool(CallToolRequest {
                 call: ToolCall {
                     tool_id: "mcp_secure1__hello".to_string(),
+                    args: serde_json::json!({ "text": "hi" }),
+                    context: ToolCallContext::new(),
+                    approval_token: Some(approved.approval_token),
+                },
+            })
+            .await?;
+        assert!(matches!(resp, CallToolResponse::Ok { .. }));
+
+        let token_calls = *oauth_state.token_calls.lock().await;
+        assert_eq!(
+            token_calls, 2,
+            "expected code exchange + refresh token grant"
+        );
+
+        daemon_task.abort();
+        secure_task.abort();
+        provider_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oauth_dpop_remote_mcp_oauth_discovery_and_refresh_enables_calls() -> anyhow::Result<()>
+    {
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let (secure_addr, oauth_state, secure_task) = start_mock_oauth_dpop_protected_mcp().await?;
+        let secure_endpoint = format!("http://{secure_addr}/mcp");
+
+        let (_state, _daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
+
+        client
+            .upsert_mcp_server("secure_dpop1", secure_endpoint.clone())
+            .await?;
+
+        let started = client
+            .mcp_oauth_start(
+                "secure_dpop1",
+                McpOAuthStartRequest {
+                    client_id: "briefcase-cli".to_string(),
+                    redirect_uri: "http://127.0.0.1/callback".to_string(),
+                    scope: Some("mcp.read".to_string()),
+                },
+            )
+            .await?;
+        assert!(started.authorization_url.contains("/as/authorize"));
+        assert!(!started.state.is_empty());
+
+        client
+            .mcp_oauth_exchange(
+                "secure_dpop1",
+                McpOAuthExchangeRequest {
+                    code: "code_mock".to_string(),
+                    state: started.state,
+                },
+            )
+            .await?;
+
+        // List tools should now succeed (daemon refreshes using stored refresh token + DPoP).
+        let tools = client.list_tools().await?.tools;
+        let token_calls_so_far = *oauth_state.token_calls.lock().await;
+        let token_ok_calls_so_far = *oauth_state.token_ok_calls.lock().await;
+        let mcp_calls_so_far = *oauth_state.mcp_calls.lock().await;
+        let mcp_ok_calls_so_far = *oauth_state.mcp_ok_calls.lock().await;
+        assert!(
+            tools.iter().any(|t| t.id == "mcp_secure_dpop1__hello"),
+            "missing remote tool; token_calls={token_calls_so_far}, token_ok_calls={token_ok_calls_so_far}, mcp_calls={mcp_calls_so_far}, mcp_ok_calls={mcp_ok_calls_so_far}, tools={:?}",
+            tools.iter().map(|t| t.id.as_str()).collect::<Vec<_>>()
+        );
+
+        // Call requires approval due to category=remote.
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "mcp_secure_dpop1__hello".to_string(),
+                    args: serde_json::json!({ "text": "hi" }),
+                    context: ToolCallContext::new(),
+                    approval_token: None,
+                },
+            })
+            .await?;
+        let approval_id = match resp {
+            CallToolResponse::ApprovalRequired { approval } => approval.id,
+            _ => anyhow::bail!("expected approval_required"),
+        };
+        let approved = client.approve(&approval_id).await?;
+
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "mcp_secure_dpop1__hello".to_string(),
                     args: serde_json::json!({ "text": "hi" }),
                     context: ToolCallContext::new(),
                     approval_token: Some(approved.approval_token),

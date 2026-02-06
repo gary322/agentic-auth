@@ -29,6 +29,7 @@ pub struct RemoteMcpOauthRecord {
     pub authorization_endpoint: String,
     pub token_endpoint: String,
     pub resource: String,
+    pub dpop_signing_alg_values_supported: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +137,7 @@ impl Db {
                       authorization_endpoint TEXT NOT NULL,
                       token_endpoint        TEXT NOT NULL,
                       resource              TEXT NOT NULL,
+                      dpop_algs_json        TEXT NOT NULL DEFAULT '[]',
                       discovered_at_rfc3339 TEXT NOT NULL
                     );
 
@@ -176,6 +178,18 @@ impl Db {
                 Ok(())
             })
             .await?;
+
+        // Best-effort schema migration for older DBs (SQLite has limited ALTER TABLE).
+        let _ = self
+            .conn
+            .call(|conn| {
+                let _ = conn.execute(
+                    "ALTER TABLE remote_mcp_oauth ADD COLUMN dpop_algs_json TEXT NOT NULL DEFAULT '[]'",
+                    [],
+                );
+                Ok(())
+            })
+            .await;
 
         // Seed a conservative default budget if missing.
         // $3/day for read tools, $0/day for write/admin (forcing approval).
@@ -312,24 +326,28 @@ impl Db {
         authorization_endpoint: &str,
         token_endpoint: &str,
         resource: &str,
+        dpop_signing_alg_values_supported: &[String],
     ) -> anyhow::Result<()> {
         let server_id = server_id.to_string();
         let issuer = issuer.to_string();
         let authorization_endpoint = authorization_endpoint.to_string();
         let token_endpoint = token_endpoint.to_string();
         let resource = resource.to_string();
+        let dpop_algs_json = serde_json::to_string(dpop_signing_alg_values_supported)
+            .context("serialize dpop algs")?;
         let discovered_at = Utc::now().to_rfc3339();
         self.conn
             .call(move |conn| {
                 conn.execute(
                     r#"
-                    INSERT INTO remote_mcp_oauth(server_id, issuer, authorization_endpoint, token_endpoint, resource, discovered_at_rfc3339)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    INSERT INTO remote_mcp_oauth(server_id, issuer, authorization_endpoint, token_endpoint, resource, dpop_algs_json, discovered_at_rfc3339)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                     ON CONFLICT(server_id) DO UPDATE SET
                       issuer=excluded.issuer,
                       authorization_endpoint=excluded.authorization_endpoint,
                       token_endpoint=excluded.token_endpoint,
                       resource=excluded.resource,
+                      dpop_algs_json=excluded.dpop_algs_json,
                       discovered_at_rfc3339=excluded.discovered_at_rfc3339
                     "#,
                     params![
@@ -338,7 +356,8 @@ impl Db {
                         authorization_endpoint,
                         token_endpoint,
                         resource,
-                        discovered_at
+                        dpop_algs_json,
+                        discovered_at,
                     ],
                 )?;
                 Ok(())
@@ -358,18 +377,22 @@ impl Db {
                 Ok(conn
                     .query_row(
                         r#"
-                        SELECT server_id, issuer, authorization_endpoint, token_endpoint, resource
+                        SELECT server_id, issuer, authorization_endpoint, token_endpoint, resource, dpop_algs_json
                         FROM remote_mcp_oauth
                         WHERE server_id=?1
                         "#,
                         params![server_id],
                         |row| {
+                            let dpop_algs_json: String = row.get(5)?;
+                            let dpop_signing_alg_values_supported: Vec<String> =
+                                serde_json::from_str(&dpop_algs_json).unwrap_or_default();
                             Ok(RemoteMcpOauthRecord {
                                 server_id: row.get(0)?,
                                 issuer: row.get(1)?,
                                 authorization_endpoint: row.get(2)?,
                                 token_endpoint: row.get(3)?,
                                 resource: row.get(4)?,
+                                dpop_signing_alg_values_supported,
                             })
                         },
                     )

@@ -84,7 +84,7 @@ For each task, include:
   - **Verify**: `cargo test -p briefcase-oauth-discovery`
   - _Reqs: FR-3, AC-4.2_
 
-- [ ] 2.2 Implement DPoP (RFC 8707) support (optional but default-on for new providers)
+- [x] 2.2 Implement DPoP (RFC 8707) support (optional but default-on for new providers)
   - **Do**: generate DPoP proofs using `briefcase-keys` signer; bind access tokens when supported.
   - **Files**: `crates/briefcase-keys/*` (Phase 4), `apps/briefcased/src/oauth.rs`
   - **Done when**: integration tests pass for DPoP-bound token flow against stub provider.

@@ -1,6 +1,9 @@
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
+use async_trait::async_trait;
 use http::header::CONTENT_TYPE;
 use reqwest::StatusCode;
 use serde_json::Value;
@@ -18,11 +21,25 @@ use crate::types::{
 };
 
 #[derive(Debug, Clone)]
+pub struct HttpRequestContext {
+    pub method: String,
+    pub url: Url,
+    pub auth_scheme: String,
+    pub auth_token: Option<String>,
+}
+
+#[async_trait]
+pub trait PerRequestHeaderProvider: Send + Sync {
+    async fn headers_for(&self, ctx: &HttpRequestContext) -> anyhow::Result<Vec<(String, String)>>;
+}
+
+#[derive(Debug, Clone)]
 pub struct HttpMcpClientOptions {
     pub endpoint: Url,
     pub protocol_version: String,
     pub session_id: Option<String>,
-    pub bearer_token: Option<String>,
+    pub auth_scheme: String,
+    pub auth_token: Option<String>,
     pub timeout: Duration,
 }
 
@@ -32,7 +49,8 @@ impl HttpMcpClientOptions {
             endpoint,
             protocol_version: PROTOCOL_VERSION_LATEST.to_string(),
             session_id: None,
-            bearer_token: None,
+            auth_scheme: "Bearer".to_string(),
+            auth_token: None,
             timeout: Duration::from_secs(30),
         }
     }
@@ -45,7 +63,10 @@ pub struct HttpMcpClient {
     endpoint: Url,
     protocol_version: String,
     session_id: Option<String>,
-    bearer_token: Option<String>,
+    auth_scheme: String,
+    auth_token: Option<String>,
+    extra_headers: BTreeMap<String, String>,
+    per_request_header_provider: Option<Arc<dyn PerRequestHeaderProvider>>,
     initialized: bool,
     ready: bool,
 }
@@ -62,14 +83,40 @@ impl HttpMcpClient {
             endpoint: opts.endpoint,
             protocol_version: opts.protocol_version,
             session_id: opts.session_id,
-            bearer_token: opts.bearer_token,
+            auth_scheme: opts.auth_scheme,
+            auth_token: opts.auth_token,
+            extra_headers: BTreeMap::new(),
+            per_request_header_provider: None,
             initialized: false,
             ready: false,
         })
     }
 
+    pub fn set_auth(&mut self, scheme: impl Into<String>, token: Option<String>) {
+        self.auth_scheme = scheme.into();
+        self.auth_token = token;
+    }
+
     pub fn set_bearer_token(&mut self, token: Option<String>) {
-        self.bearer_token = token;
+        self.set_auth("Bearer", token);
+    }
+
+    pub fn set_header(&mut self, name: &str, value: Option<String>) {
+        match value {
+            Some(v) => {
+                self.extra_headers.insert(name.to_string(), v);
+            }
+            None => {
+                self.extra_headers.remove(name);
+            }
+        }
+    }
+
+    pub fn set_per_request_header_provider(
+        &mut self,
+        provider: Option<Arc<dyn PerRequestHeaderProvider>>,
+    ) {
+        self.per_request_header_provider = provider;
     }
 
     pub fn session_id(&self) -> Option<&str> {
@@ -154,8 +201,26 @@ impl HttpMcpClient {
             .header("mcp-protocol-version", &self.protocol_version)
             .json(&msg);
 
-        if let Some(tok) = &self.bearer_token {
-            req = req.bearer_auth(tok);
+        if let Some(tok) = &self.auth_token {
+            req = req.header(
+                reqwest::header::AUTHORIZATION,
+                format!("{} {}", self.auth_scheme, tok),
+            );
+        }
+        for (k, v) in &self.extra_headers {
+            req = req.header(k, v);
+        }
+
+        if let Some(p) = &self.per_request_header_provider {
+            let ctx = HttpRequestContext {
+                method: "POST".to_string(),
+                url: self.endpoint.clone(),
+                auth_scheme: self.auth_scheme.clone(),
+                auth_token: self.auth_token.clone(),
+            };
+            for (k, v) in p.headers_for(&ctx).await? {
+                req = req.header(k, v);
+            }
         }
 
         if let Some(sid) = &self.session_id {
@@ -185,8 +250,26 @@ impl HttpMcpClient {
             .header("mcp-protocol-version", &self.protocol_version)
             .json(&req_msg);
 
-        if let Some(tok) = &self.bearer_token {
-            req = req.bearer_auth(tok);
+        if let Some(tok) = &self.auth_token {
+            req = req.header(
+                reqwest::header::AUTHORIZATION,
+                format!("{} {}", self.auth_scheme, tok),
+            );
+        }
+        for (k, v) in &self.extra_headers {
+            req = req.header(k, v);
+        }
+
+        if let Some(p) = &self.per_request_header_provider {
+            let ctx = HttpRequestContext {
+                method: "POST".to_string(),
+                url: self.endpoint.clone(),
+                auth_scheme: self.auth_scheme.clone(),
+                auth_token: self.auth_token.clone(),
+            };
+            for (k, v) in p.headers_for(&ctx).await? {
+                req = req.header(k, v);
+            }
         }
 
         if let Some(sid) = &self.session_id {

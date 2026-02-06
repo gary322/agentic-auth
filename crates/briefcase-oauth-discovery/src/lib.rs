@@ -15,6 +15,7 @@ pub struct OAuthDiscoveryResult {
     pub authorization_endpoint: Url,
     pub token_endpoint: Url,
     pub scopes_supported: Option<Vec<String>>,
+    pub dpop_signing_alg_values_supported: Option<Vec<String>>,
 }
 
 #[derive(Debug, Error)]
@@ -46,6 +47,8 @@ struct AuthorizationServerMetadata {
     token_endpoint: Option<String>,
     #[serde(default)]
     scopes_supported: Option<Vec<String>>,
+    #[serde(default)]
+    dpop_signing_alg_values_supported: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +140,7 @@ impl OAuthDiscoveryClient {
             authorization_endpoint,
             token_endpoint,
             scopes_supported: as_meta.scopes_supported.or(prm.scopes_supported),
+            dpop_signing_alg_values_supported: as_meta.dpop_signing_alg_values_supported,
         };
 
         debug!(

@@ -6,7 +6,11 @@ use anyhow::Context as _;
 use briefcase_core::{
     AuthMethod, OutputFirewall, ToolCategory, ToolCost, ToolSpec, util::sha256_hex,
 };
-use briefcase_mcp::{CallToolParams, HttpMcpClient, HttpMcpClientOptions, ListToolsParams};
+use briefcase_keys::{KeyAlgorithm, KeyHandle, SoftwareKeyManager};
+use briefcase_mcp::{
+    CallToolParams, HttpMcpClient, HttpMcpClientOptions, HttpRequestContext, ListToolsParams,
+    PerRequestHeaderProvider,
+};
 use briefcase_oauth_discovery::OAuthDiscoveryClient;
 use briefcase_secrets::SecretStore;
 use chrono::{DateTime, Utc};
@@ -26,11 +30,39 @@ struct RemoteToolDef {
     input_schema: serde_json::Value,
 }
 
+#[derive(Clone)]
+struct DpopHeaderProvider {
+    signer: Arc<dyn briefcase_keys::Signer>,
+}
+
+#[async_trait::async_trait]
+impl PerRequestHeaderProvider for DpopHeaderProvider {
+    async fn headers_for(&self, ctx: &HttpRequestContext) -> anyhow::Result<Vec<(String, String)>> {
+        if !ctx.auth_scheme.eq_ignore_ascii_case("dpop") {
+            return Ok(Vec::new());
+        }
+        let Some(tok) = ctx.auth_token.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let proof = crate::dpop::dpop_proof_for_resource_request(
+            self.signer.as_ref(),
+            &ctx.url,
+            &ctx.method,
+            tok,
+        )
+        .await?;
+        Ok(vec![("DPoP".to_string(), proof)])
+    }
+}
+
 struct RemoteSession {
     endpoint_url: String,
     client: HttpMcpClient,
     oauth_token_endpoint: Option<String>,
+    oauth_dpop_algs: Option<Vec<String>>,
+    dpop_signer: Option<Arc<dyn briefcase_keys::Signer>>,
     access_token: Option<String>,
+    access_token_type: Option<String>,
     access_token_expires_at: Option<DateTime<Utc>>,
     tools: HashMap<String, RemoteToolDef>, // tool_id -> def
     fetched_at: Option<Instant>,
@@ -41,6 +73,7 @@ pub struct RemoteMcpManager {
     db: Db,
     secrets: Arc<dyn SecretStore>,
     oauth: Arc<OAuthDiscoveryClient>,
+    keys: SoftwareKeyManager,
     http: reqwest::Client,
     sessions: Arc<Mutex<HashMap<String, Arc<Mutex<RemoteSession>>>>>, // server_id -> session
     ttl: Duration,
@@ -57,10 +90,12 @@ impl RemoteMcpManager {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("build reqwest client")?;
+        let keys = SoftwareKeyManager::new(secrets.clone());
         Ok(Self {
             db,
             secrets,
             oauth,
+            keys,
             http,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             ttl: Duration::from_secs(30),
@@ -137,12 +172,15 @@ impl RemoteMcpManager {
             guard.tools.clear();
             guard.fetched_at = None;
             guard.oauth_token_endpoint = None;
+            guard.oauth_dpop_algs = None;
+            guard.dpop_signer = None;
             guard.access_token = None;
+            guard.access_token_type = None;
             guard.access_token_expires_at = None;
         }
 
         // If OAuth is configured for this server, ensure we have an access token attached.
-        self.ensure_bearer_token(&server_id, &server, &mut guard)
+        self.ensure_access_token(&server_id, &server, &mut guard)
             .await?;
 
         if guard
@@ -213,7 +251,10 @@ impl RemoteMcpManager {
             endpoint_url: server.endpoint_url.clone(),
             client,
             oauth_token_endpoint: None,
+            oauth_dpop_algs: None,
+            dpop_signer: None,
             access_token: None,
+            access_token_type: None,
             access_token_expires_at: None,
             tools: HashMap::new(),
             fetched_at: None,
@@ -238,7 +279,10 @@ impl RemoteMcpManager {
             guard.tools.clear();
             guard.fetched_at = None;
             guard.oauth_token_endpoint = None;
+            guard.oauth_dpop_algs = None;
+            guard.dpop_signer = None;
             guard.access_token = None;
+            guard.access_token_type = None;
             guard.access_token_expires_at = None;
         }
 
@@ -260,7 +304,7 @@ impl RemoteMcpManager {
         server: &RemoteMcpServerRecord,
         session: &mut RemoteSession,
     ) -> anyhow::Result<()> {
-        self.ensure_bearer_token(server_id, server, session).await?;
+        self.ensure_access_token(server_id, server, session).await?;
 
         if !session.client.is_ready() {
             info!(server_id, "initializing remote mcp session");
@@ -294,16 +338,67 @@ impl RemoteMcpManager {
         Ok(())
     }
 
-    async fn ensure_bearer_token(
+    fn select_dpop_key_algorithm(supported_algs: &[String]) -> Option<KeyAlgorithm> {
+        if supported_algs
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case("EdDSA"))
+        {
+            return Some(KeyAlgorithm::Ed25519);
+        }
+        if supported_algs
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case("ES256"))
+        {
+            return Some(KeyAlgorithm::P256);
+        }
+        None
+    }
+
+    async fn ensure_dpop_signer(
+        &self,
+        server_id: &str,
+        supported_algs: &[String],
+    ) -> anyhow::Result<Option<Arc<dyn briefcase_keys::Signer>>> {
+        let Some(want_alg) = Self::select_dpop_key_algorithm(supported_algs) else {
+            return Ok(None);
+        };
+
+        let key = format!("oauth.mcp.{server_id}.dpop_key_handle");
+        if let Some(raw) = self.secrets.get(&key).await? {
+            let handle =
+                KeyHandle::from_json(&raw.into_inner()).context("decode dpop key handle")?;
+            if handle.algorithm == want_alg {
+                return Ok(Some(self.keys.signer(handle)));
+            }
+            // Best-effort rotate mismatched key.
+            let _ = self.keys.delete(&handle).await;
+        }
+
+        let handle = self.keys.generate(want_alg).await?;
+        self.secrets
+            .put(&key, briefcase_core::Sensitive(handle.to_json()?))
+            .await?;
+        Ok(Some(self.keys.signer(handle)))
+    }
+
+    async fn ensure_access_token(
         &self,
         server_id: &str,
         server: &RemoteMcpServerRecord,
         session: &mut RemoteSession,
     ) -> anyhow::Result<()> {
+        // Ensure we never accidentally send a stale proof header; DPoP proofs must be per-request.
+        session.client.set_header("DPoP", None);
+
         let key = format!("oauth.mcp.{server_id}.refresh_token");
         let Some(raw) = self.secrets.get(&key).await? else {
             session.client.set_bearer_token(None);
+            session.client.set_per_request_header_provider(None);
+            session.oauth_token_endpoint = None;
+            session.oauth_dpop_algs = None;
+            session.dpop_signer = None;
             session.access_token = None;
+            session.access_token_type = None;
             session.access_token_expires_at = None;
             return Ok(());
         };
@@ -317,16 +412,24 @@ impl RemoteMcpManager {
             .map(|r| r.client_id)
             .unwrap_or_else(|| "briefcase-cli".to_string());
 
-        let token_endpoint = match session.oauth_token_endpoint.clone() {
-            Some(v) => v,
-            None => {
+        let (token_endpoint, dpop_algs) = match (
+            session.oauth_token_endpoint.clone(),
+            session.oauth_dpop_algs.clone(),
+        ) {
+            (Some(te), Some(algs)) => (te, algs),
+            _ => {
                 if let Some(meta) = self.db.get_remote_mcp_oauth(server_id).await? {
                     session.oauth_token_endpoint = Some(meta.token_endpoint.clone());
-                    meta.token_endpoint
+                    session.oauth_dpop_algs = Some(meta.dpop_signing_alg_values_supported.clone());
+                    (meta.token_endpoint, meta.dpop_signing_alg_values_supported)
                 } else {
                     let endpoint = Url::parse(&server.endpoint_url)
                         .context("parse remote mcp endpoint_url")?;
                     let d = self.oauth.discover(&endpoint).await?;
+                    let dpop_algs = d
+                        .dpop_signing_alg_values_supported
+                        .clone()
+                        .unwrap_or_default();
                     self.db
                         .upsert_remote_mcp_oauth(
                             server_id,
@@ -334,10 +437,12 @@ impl RemoteMcpManager {
                             d.authorization_endpoint.as_str(),
                             d.token_endpoint.as_str(),
                             d.resource.as_str(),
+                            &dpop_algs,
                         )
                         .await?;
                     session.oauth_token_endpoint = Some(d.token_endpoint.as_str().to_string());
-                    d.token_endpoint.as_str().to_string()
+                    session.oauth_dpop_algs = Some(dpop_algs.clone());
+                    (d.token_endpoint.as_str().to_string(), dpop_algs)
                 }
             }
         };
@@ -347,9 +452,39 @@ impl RemoteMcpManager {
             && let Some(exp) = session.access_token_expires_at
             && now + chrono::Duration::seconds(30) < exp
         {
-            session.client.set_bearer_token(Some(tok.clone()));
+            let scheme = session
+                .access_token_type
+                .clone()
+                .unwrap_or_else(|| "Bearer".to_string());
+            session.client.set_auth(scheme, Some(tok.clone()));
+
+            // Ensure the per-request DPoP proof hook is installed for DPoP tokens.
+            if session
+                .access_token_type
+                .as_deref()
+                .map(|s| s.eq_ignore_ascii_case("dpop"))
+                .unwrap_or(false)
+            {
+                let dpop_algs = session.oauth_dpop_algs.clone().unwrap_or_default();
+                let signer = match session.dpop_signer.clone() {
+                    Some(s) => s,
+                    None => self
+                        .ensure_dpop_signer(server_id, &dpop_algs)
+                        .await?
+                        .context("dpop token type but no supported dpop signer")?,
+                };
+                session.dpop_signer = Some(signer.clone());
+                session
+                    .client
+                    .set_per_request_header_provider(Some(Arc::new(DpopHeaderProvider { signer })));
+            } else {
+                session.client.set_per_request_header_provider(None);
+            }
             return Ok(());
         }
+
+        // DPoP is optional. If the auth server supports it, use a per-server PoP key.
+        let dpop_signer = self.ensure_dpop_signer(server_id, &dpop_algs).await?;
 
         #[derive(Debug, Deserialize)]
         struct OAuthTokenResponse {
@@ -359,17 +494,21 @@ impl RemoteMcpManager {
             expires_in: Option<i64>,
         }
 
-        let resp = self
-            .http
-            .post(token_endpoint)
-            .form(&[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", refresh_token.as_str()),
-                ("client_id", client_id.as_str()),
-            ])
-            .send()
-            .await
-            .context("oauth refresh request")?;
+        let mut req = self.http.post(token_endpoint.clone()).form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token.as_str()),
+            ("client_id", client_id.as_str()),
+        ]);
+        if let Some(signer) = &dpop_signer {
+            let token_endpoint_url =
+                Url::parse(&token_endpoint).context("parse oauth token_endpoint url")?;
+            let proof =
+                crate::dpop::dpop_proof_for_token_endpoint(signer.as_ref(), &token_endpoint_url)
+                    .await?;
+            req = req.header("DPoP", proof);
+        }
+
+        let resp = req.send().await.context("oauth refresh request")?;
         if !resp.status().is_success() {
             anyhow::bail!("oauth refresh failed: {}", resp.status());
         }
@@ -377,7 +516,14 @@ impl RemoteMcpManager {
             .json::<OAuthTokenResponse>()
             .await
             .context("decode oauth token response")?;
-        let _token_type = tr.token_type;
+
+        let token_type = if tr.token_type.eq_ignore_ascii_case("bearer") {
+            "Bearer".to_string()
+        } else if tr.token_type.eq_ignore_ascii_case("dpop") {
+            "DPoP".to_string()
+        } else {
+            tr.token_type.clone()
+        };
 
         if let Some(new_rt) = tr.refresh_token {
             self.secrets
@@ -387,8 +533,30 @@ impl RemoteMcpManager {
 
         let expires_at = now + chrono::Duration::seconds(tr.expires_in.unwrap_or(600));
         session.access_token = Some(tr.access_token.clone());
+        session.access_token_type = Some(token_type.clone());
         session.access_token_expires_at = Some(expires_at);
-        session.client.set_bearer_token(Some(tr.access_token));
+        session
+            .client
+            .set_auth(token_type.clone(), Some(tr.access_token));
+
+        session.dpop_signer = if token_type.eq_ignore_ascii_case("dpop") {
+            dpop_signer
+        } else {
+            None
+        };
+
+        if token_type.eq_ignore_ascii_case("dpop") {
+            let signer = session
+                .dpop_signer
+                .clone()
+                .context("dpop token type but no dpop signer available")?;
+            session
+                .client
+                .set_per_request_header_provider(Some(Arc::new(DpopHeaderProvider { signer })));
+        } else {
+            session.client.set_per_request_header_provider(None);
+        }
+
         Ok(())
     }
 }

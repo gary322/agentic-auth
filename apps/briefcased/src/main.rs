@@ -12,6 +12,7 @@ use base64::Engine as _;
 
 mod app;
 mod db;
+mod dpop;
 mod firewall;
 mod middleware;
 mod provider;

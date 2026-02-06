@@ -13,7 +13,9 @@ mod server;
 mod sse;
 mod types;
 
-pub use http_client::{HttpMcpClient, HttpMcpClientOptions};
+pub use http_client::{
+    HttpMcpClient, HttpMcpClientOptions, HttpRequestContext, PerRequestHeaderProvider,
+};
 pub use jsonrpc::{JsonRpcError, JsonRpcId, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
 pub use server::{McpConnection, McpHandler, McpServerConfig};
 pub use types::{
