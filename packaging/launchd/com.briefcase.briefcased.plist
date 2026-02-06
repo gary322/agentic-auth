@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.briefcase.briefcased</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <!-- Adjust path to where you installed the binary -->
+      <string>/usr/local/bin/briefcased</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+      <!-- Local state (sqlite db, unix socket, auth token). -->
+      <key>BRIEFCASE_DATA_DIR</key>
+      <string>/Users/Shared/briefcase</string>
+
+      <!-- Optional: encrypted-file secret backend for headless usage. -->
+      <!--
+      <key>BRIEFCASE_SECRET_BACKEND</key>
+      <string>file</string>
+      <key>BRIEFCASE_MASTER_PASSPHRASE</key>
+      <string>change-me</string>
+      -->
+
+      <!-- Provider base URL (reference gateway). -->
+      <!-- <key>BRIEFCASE_PROVIDER_BASE_URL</key> <string>http://127.0.0.1:9099</string> -->
+
+      <!-- Payments helper. -->
+      <!-- <key>BRIEFCASE_PAYMENT_HELPER</key> <string>/usr/local/bin/briefcase-payment-helper</string> -->
+
+      <!-- Optional risk classifier. -->
+      <!-- <key>BRIEFCASE_RISK_CLASSIFIER_URL</key> <string>https://classifier.example.com/v1/classify</string> -->
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/briefcased.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/briefcased.err.log</string>
+  </dict>
+</plist>
+

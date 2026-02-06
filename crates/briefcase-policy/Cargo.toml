@@ -1,0 +1,15 @@
+[package]
+name = "briefcase-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+cedar-policy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+briefcase-core = { path = "../briefcase-core" }

@@ -1,0 +1,63 @@
+# Architecture
+
+## Goal
+
+Provide a "credential briefcase" where:
+
+- the LLM is untrusted
+- secrets are not exposed to the agent runtime
+- tool calls are policy-bounded and auditable
+
+## Components
+
+1. `briefcased` (daemon)
+- Holds secrets/credentials (OS keychain by default, encrypted-file fallback).
+- Generates and stores a holder `did:key` (v0.1: Ed25519).
+- Enforces Cedar policy (allow/deny + approval gating).
+- Runs non-authoritative risk scoring (can require approval, never bypass policy).
+- Enforces budgets (category-based daily limits).
+- Executes connectors to providers (HTTP, MCP in future).
+- Stores tamper-evident receipts (hash chained).
+
+2. `mcp-gateway`
+- The only MCP server the agent connects to.
+- Lists tools and forwards tool calls to `briefcased`.
+- Redacts/serializes results for agent consumption.
+
+3. `briefcase-cli`
+- Lists tools, triggers calls, handles approvals, inspects receipts.
+
+3.5. `briefcase-ui`
+- Local web UI that proxies to the daemon (approvals + receipts + provider status).
+
+4. `agent-access-gateway` (provider reference)
+- Challenges with HTTP 402 (demo x402/l402).
+- Supports OAuth 2.1 + PKCE (demo).
+- Issues a demo VC entitlement (JWT) and accepts it for capability issuance.
+- Issues short-lived capability tokens (JWT).
+- Optionally binds capabilities to a client key (PoP) and enforces replay defenses.
+- Meters usage.
+
+## Data Flow (Happy Path)
+
+1. Agent calls `tools/call` on `mcp-gateway`.
+2. Gateway forwards to `briefcased` via local API with a session token.
+3. Daemon validates args, evaluates policy and budgets, and executes connector.
+4. Daemon stores a receipt and returns a redacted result with provenance.
+
+## Approval Flow
+
+1. Policy decision requires approval.
+2. Daemon creates an approval request and returns `approval_required`.
+3. User approves via CLI (or future UI), obtaining an `approval_token`.
+4. Tool call is retried with the `approval_token`.
+
+## Provider Auth Strategy (v0.1)
+
+For tools that call a provider connector, the daemon prefers:
+
+1. VC entitlement (fetch capability with `x-vc-jwt`)
+2. OAuth refresh token (refresh access token, then fetch capability)
+3. Micropayment challenge (x402 / l402 demo), then fetch capability
+
+The agent only ever receives redacted tool outputs and provenance; raw secrets remain inside the daemon.

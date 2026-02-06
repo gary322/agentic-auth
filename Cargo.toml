@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+members = [
+  "apps/agent-access-gateway",
+  "apps/briefcase-cli",
+  "apps/briefcase-ui",
+  "apps/briefcased",
+  "apps/mcp-gateway",
+  "crates/briefcase-api",
+  "crates/briefcase-core",
+  "crates/briefcase-identity",
+  "crates/briefcase-payments",
+  "crates/briefcase-risk",
+  "crates/briefcase-policy",
+  "crates/briefcase-receipts",
+  "crates/briefcase-secrets",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/your-org/credential-briefcase"
+
+[workspace.dependencies]
+anyhow = "1.0.97"
+aes-gcm = "0.10.3"
+argon2 = "0.5.3"
+async-trait = "0.1.89"
+axum = { version = "0.8.4", features = ["macros"] }
+base64 = "0.22.1"
+bs58 = "0.5.1"
+bytes = "1.10.0"
+cedar-policy = "=4.5.2"
+chrono = { version = "0.4.40", default-features = false, features = ["clock", "serde", "std"] }
+clap = { version = "4.5.31", features = ["derive", "env"] }
+directories = "6.0.0"
+ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std"] }
+hex = "0.4.3"
+hmac = "0.12.1"
+http = "1.2.0"
+http-body-util = "0.1.2"
+hyper = { version = "1.6.0", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1.10", features = ["client", "client-legacy", "http1"] }
+hyperlocal = "0.9.1"
+jsonwebtoken = "9.3.0"
+jsonschema = "0.29.0"
+keyring = "2.3.3"
+rand = "0.9.0"
+reqwest = { version = "0.12.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+serde = { version = "1.0.218", features = ["derive"] }
+serde_json = "1.0.139"
+sha2 = "0.10.8"
+subtle = "2.6.1"
+thiserror = "2.0.11"
+tokio = { version = "1.43.0", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rusqlite = "0.6.0"
+tower = "0.5.2"
+tower-http = { version = "0.6.2", features = ["trace"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt", "json"] }
+uuid = { version = "1.14.0", features = ["serde", "v4"] }
+tempfile = "3.16.0"
+url = "2.5.4"
+zeroize = { version = "1.8.1", features = ["derive"] }

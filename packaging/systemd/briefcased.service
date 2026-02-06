@@ -1,0 +1,57 @@
+[Unit]
+Description=Credential Briefcase daemon
+After=network.target
+
+[Service]
+Type=simple
+
+# Adjust to your install location (e.g. /usr/local/bin/briefcased).
+ExecStart=briefcased
+
+Restart=on-failure
+RestartSec=2s
+
+# Local state (sqlite db, unix socket, auth token).
+Environment=BRIEFCASE_DATA_DIR=/var/lib/briefcase
+
+# Secret backend:
+# - default: keyring (recommended on desktops)
+# - file backend for headless servers:
+#   Environment=BRIEFCASE_SECRET_BACKEND=file
+#   Environment=BRIEFCASE_MASTER_PASSPHRASE=change-me
+
+# Provider base URL (reference gateway):
+# Environment=BRIEFCASE_PROVIDER_BASE_URL=https://provider.example.com
+
+# Payments:
+# Environment=BRIEFCASE_PAYMENT_HELPER=/usr/local/bin/briefcase-payment-helper
+
+# Optional risk classifier:
+# Environment=BRIEFCASE_RISK_CLASSIFIER_URL=https://classifier.example.com/v1/classify
+
+# Security hardening (tune for your environment).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RestrictNamespaces=true
+RestrictRealtime=true
+
+# If you want systemd to enforce egress restrictions, configure IPAddressAllow/Deny.
+# Note: `briefcased` requires outbound access to configured providers / payment rails.
+#IPAddressDeny=any
+#IPAddressAllow=localhost
+
+User=briefcase
+Group=briefcase
+
+RuntimeDirectory=briefcase
+StateDirectory=briefcase
+
+[Install]
+WantedBy=multi-user.target
+
