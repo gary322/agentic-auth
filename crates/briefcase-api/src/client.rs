@@ -205,7 +205,18 @@ impl BriefcaseClient {
     }
 
     pub async fn list_receipts(&self) -> Result<ListReceiptsResponse, BriefcaseClientError> {
-        self.get_json("/v1/receipts?limit=50&offset=0").await
+        self.list_receipts_paged(50, 0).await
+    }
+
+    pub async fn list_receipts_paged(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> Result<ListReceiptsResponse, BriefcaseClientError> {
+        // Hard cap to avoid accidental giant responses in UI polling.
+        let limit = limit.min(500);
+        self.get_json(&format!("/v1/receipts?limit={limit}&offset={offset}"))
+            .await
     }
 
     pub async fn verify_receipts(&self) -> Result<VerifyReceiptsResponse, BriefcaseClientError> {

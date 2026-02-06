@@ -25,6 +25,8 @@ jobs:
 
       - name: pnpm install
         shell: bash
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
         run: pnpm install --frozen-lockfile
 
       - name: Generate OpenAPI clients (must be committed)
@@ -40,6 +42,13 @@ jobs:
       - name: pnpm test
         shell: bash
         run: pnpm -r test
+
+      - name: briefcase-extension build artifacts (must be committed)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          pnpm -C apps/briefcase-extension build
+          git diff --exit-code
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
@@ -63,6 +72,39 @@ jobs:
       - name: briefcase-keys (windows backend)
         if: matrix.os == 'windows-latest'
         run: cargo test -p briefcase-keys --features windows windows_
+
+  extension_e2e:
+    name: extension e2e (playwright)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pnpm
+        shell: bash
+        run: corepack enable
+
+      - name: pnpm install
+        shell: bash
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+        run: pnpm install --frozen-lockfile
+
+      - name: Build extension
+        shell: bash
+        run: pnpm -C apps/briefcase-extension build
+
+      - name: Install Playwright Chromium
+        shell: bash
+        run: pnpm -C apps/briefcase-extension exec playwright install --with-deps chromium
+
+      - name: Playwright tests
+        shell: bash
+        run: pnpm -C apps/briefcase-extension test:e2e
 
   pkcs11:
     name: pkcs11 (SoftHSM)

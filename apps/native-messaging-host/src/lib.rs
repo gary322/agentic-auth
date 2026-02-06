@@ -132,6 +132,46 @@ async fn handle(client: &BriefcaseClient, req: NativeRequest) -> anyhow::Result<
     }
 
     #[derive(Debug, Deserialize)]
+    struct DeleteMcpServerParams {
+        server_id: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct UpsertProviderParams {
+        provider_id: String,
+        base_url: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct FetchVcParams {
+        provider_id: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct DeleteProviderParams {
+        provider_id: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct SetBudgetParams {
+        category: String,
+        daily_limit_microusd: i64,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ApproveParams {
+        id: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ListReceiptsParams {
+        #[serde(default)]
+        limit: Option<u32>,
+        #[serde(default)]
+        offset: Option<u32>,
+    }
+
+    #[derive(Debug, Deserialize)]
     struct McpOAuthStartParams {
         server_id: String,
         client_id: String,
@@ -152,6 +192,25 @@ async fn handle(client: &BriefcaseClient, req: NativeRequest) -> anyhow::Result<
             client.health().await?;
             Ok(ok_json!(serde_json::json!({ "status": "ok" })))
         }
+        "identity" => Ok(ok_json!(client.identity().await?)),
+        "list_tools" => Ok(ok_json!(client.list_tools().await?)),
+        "list_providers" => Ok(ok_json!(client.list_providers().await?)),
+        "upsert_provider" => {
+            let p: UpsertProviderParams =
+                serde_json::from_value(req.params).context("parse params")?;
+            Ok(ok_json!(
+                client.upsert_provider(&p.provider_id, p.base_url).await?
+            ))
+        }
+        "fetch_vc" => {
+            let p: FetchVcParams = serde_json::from_value(req.params).context("parse params")?;
+            Ok(ok_json!(client.fetch_vc(&p.provider_id).await?))
+        }
+        "delete_provider" => {
+            let p: DeleteProviderParams =
+                serde_json::from_value(req.params).context("parse params")?;
+            Ok(ok_json!(client.delete_provider(&p.provider_id).await?))
+        }
         "list_mcp_servers" => Ok(ok_json!(client.list_mcp_servers().await?)),
         "upsert_mcp_server" => {
             let p: UpsertMcpServerParams =
@@ -161,6 +220,11 @@ async fn handle(client: &BriefcaseClient, req: NativeRequest) -> anyhow::Result<
                     .upsert_mcp_server(&p.server_id, p.endpoint_url)
                     .await?
             ))
+        }
+        "delete_mcp_server" => {
+            let p: DeleteMcpServerParams =
+                serde_json::from_value(req.params).context("parse params")?;
+            Ok(ok_json!(client.delete_mcp_server(&p.server_id).await?))
         }
         "mcp_oauth_start" => {
             let p: McpOAuthStartParams =
@@ -193,6 +257,29 @@ async fn handle(client: &BriefcaseClient, req: NativeRequest) -> anyhow::Result<
                     .await?
             ))
         }
+        "list_budgets" => Ok(ok_json!(client.list_budgets().await?)),
+        "set_budget" => {
+            let p: SetBudgetParams = serde_json::from_value(req.params).context("parse params")?;
+            Ok(ok_json!(
+                client
+                    .set_budget(&p.category, p.daily_limit_microusd)
+                    .await?
+            ))
+        }
+        "list_approvals" => Ok(ok_json!(client.list_approvals().await?)),
+        "approve" => {
+            let p: ApproveParams = serde_json::from_value(req.params).context("parse params")?;
+            let id = uuid::Uuid::parse_str(&p.id).context("invalid approval id")?;
+            Ok(ok_json!(client.approve(&id).await?))
+        }
+        "list_receipts" => {
+            let p: ListReceiptsParams =
+                serde_json::from_value(req.params).context("parse params")?;
+            let limit = p.limit.unwrap_or(50);
+            let offset = p.offset.unwrap_or(0);
+            Ok(ok_json!(client.list_receipts_paged(limit, offset).await?))
+        }
+        "verify_receipts" => Ok(ok_json!(client.verify_receipts().await?)),
         other => Ok(NativeResponse {
             id,
             ok: false,

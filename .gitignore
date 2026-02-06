@@ -7,6 +7,8 @@ node_modules
 
 # Browser extension build output
 apps/briefcase-extension/extension/dist
+apps/briefcase-extension/test-results
+apps/briefcase-extension/playwright-report
 
 # OS / editors
 .DS_Store

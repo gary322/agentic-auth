@@ -8,5 +8,5 @@
     "types": ["node", "chrome"],
     "skipLibCheck": true
   },
-  "include": ["src/**/*.ts", "vitest.config.ts"]
+  "include": ["src/**/*.ts", "e2e/**/*.ts", "vitest.config.ts", "playwright.config.ts"]
 }

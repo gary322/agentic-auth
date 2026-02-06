@@ -8,9 +8,11 @@
     "gen": "openapi-typescript ../../openapi/briefcased.yaml -o src/gen/briefcased.ts",
     "build": "node scripts/build.mjs",
     "lint": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:e2e": "node scripts/build.mjs && playwright test"
   },
   "devDependencies": {
+    "@playwright/test": "^1.58.2",
     "@types/chrome": "^0.0.268",
     "@types/node": "^20.11.30",
     "esbuild": "^0.24.0",

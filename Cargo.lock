@@ -2918,6 +2918,8 @@ dependencies = [
  "anyhow",
  "axum",
  "briefcase-api",
+ "briefcase-core",
+ "chrono",
  "clap",
  "directories",
  "serde",

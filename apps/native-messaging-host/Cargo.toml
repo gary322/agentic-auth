@@ -14,12 +14,16 @@ serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true
 
 briefcase-api = { path = "../../crates/briefcase-api" }
 
 [dev-dependencies]
 axum.workspace = true
+chrono.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+
+briefcase-core = { path = "../../crates/briefcase-core" }

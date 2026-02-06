@@ -149,13 +149,13 @@ For each task, include:
   - **Done when**: macOS integration test passes on environments that support it; fallback works elsewhere.
   - **Verify**: `cargo test -p briefcase-keys --features apple apple_*`
 
-- [ ] 4.5 Implement Windows CNG/NCrypt backend (TPM where possible)
+- [x] 4.5 Implement Windows CNG/NCrypt backend (TPM where possible)
   - **Do**: implement CNG signer; detect TPM provider; fallback to software key.
   - **Files**: `crates/briefcase-keys/src/windows.rs`
   - **Done when**: Windows CI runs software fallback tests; optional hardware tests documented.
   - **Verify**: `cargo test -p briefcase-keys --features windows windows_`
 
-- [ ] 4.6 Integrate keys into OAuth (DPoP) and capability PoP
+- [x] 4.6 Integrate keys into OAuth (DPoP) and capability PoP
   - **Do**: standardize PoP on DPoP where possible; update provider gateway to verify; update daemon client to attach proofs.
   - **Files**: `apps/agent-access-gateway/src/main.rs`, `apps/briefcased/src/provider.rs`
   - **Done when**: replay protection and PoP binding pass integration tests.
@@ -163,13 +163,13 @@ For each task, include:
 
 ## Phase 5: Browser Extension + Native Messaging Host
 
-- [ ] 5.1 Implement native messaging host
+- [x] 5.1 Implement native messaging host
   - **Do**: build `apps/native-messaging-host` in Rust; define JSON message protocol; harden against origin confusion.
   - **Files**: `apps/native-messaging-host/*`, `packaging/native-messaging/*`
   - **Done when**: extension can call daemon APIs via host; host cannot be used by other OS users.
   - **Verify**: integration test + manual extension smoke.
 
-- [ ] 5.2 Build extension UI (approvals/receipts/providers/budgets)
+- [x] 5.2 Build extension UI (approvals/receipts/providers/budgets)
   - **Do**: implement MV3 extension with UI pages; subscribe to approval stream; approve actions; view receipts.
   - **Files**: `apps/briefcase-extension/*`
   - **Done when**: approvals can be approved from the extension; receipts are viewable and exportable.

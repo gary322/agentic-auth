@@ -8,37 +8,140 @@
   </head>
   <body>
     <main>
-      <h1>Credential Briefcase</h1>
-      <div id="status" class="status"></div>
+      <header class="top">
+        <div class="brand">
+          <h1>Credential Briefcase</h1>
+          <div id="status" class="status"></div>
+        </div>
 
-      <section class="card">
-        <h2>Add Remote MCP Server</h2>
-        <form id="add-server-form">
-          <label>
-            Server ID
-            <input id="server-id" name="server_id" type="text" required maxlength="64" />
-          </label>
-          <label>
-            Endpoint URL
-            <input
-              id="endpoint-url"
-              name="endpoint_url"
-              type="url"
-              required
-              placeholder="https://example.com/mcp"
-            />
-          </label>
-          <button type="submit">Add Server</button>
-        </form>
+        <nav class="tabs" aria-label="Briefcase tabs">
+          <button class="tab active" data-tab="mcp" type="button">MCP</button>
+          <button class="tab" data-tab="providers" type="button">Providers</button>
+          <button class="tab" data-tab="approvals" type="button">Approvals</button>
+          <button class="tab" data-tab="receipts" type="button">Receipts</button>
+          <button class="tab" data-tab="budgets" type="button">Budgets</button>
+        </nav>
+      </header>
+
+      <section id="tab-mcp" class="tabpane">
+        <section class="card">
+          <h2>Add Remote MCP Server</h2>
+          <form id="add-server-form">
+            <label>
+              Server ID
+              <input id="server-id" name="server_id" type="text" required maxlength="64" />
+            </label>
+            <label>
+              Endpoint URL
+              <input
+                id="endpoint-url"
+                name="endpoint_url"
+                type="url"
+                required
+                placeholder="https://example.com/mcp"
+              />
+            </label>
+            <button type="submit">Add Server</button>
+          </form>
+        </section>
+
+        <section class="card">
+          <div class="card-head">
+            <h2>Servers</h2>
+            <button id="refresh-servers" class="small" type="button">Refresh</button>
+          </div>
+          <div id="servers" class="list"></div>
+        </section>
       </section>
 
-      <section class="card">
-        <h2>Servers</h2>
-        <div id="servers" class="servers"></div>
+      <section id="tab-providers" class="tabpane hidden">
+        <section class="card">
+          <h2>Add Provider</h2>
+          <form id="add-provider-form">
+            <label>
+              Provider ID
+              <input id="provider-id" name="provider_id" type="text" required maxlength="64" />
+            </label>
+            <label>
+              Base URL
+              <input
+                id="provider-base-url"
+                name="base_url"
+                type="url"
+                required
+                placeholder="http://127.0.0.1:9099"
+              />
+            </label>
+            <button type="submit">Add Provider</button>
+          </form>
+        </section>
+
+        <section class="card">
+          <div class="card-head">
+            <h2>Providers</h2>
+            <button id="refresh-providers" class="small" type="button">Refresh</button>
+          </div>
+          <div id="providers" class="list"></div>
+        </section>
+      </section>
+
+      <section id="tab-approvals" class="tabpane hidden">
+        <section class="card">
+          <div class="card-head">
+            <h2>Pending Approvals</h2>
+            <button id="refresh-approvals" class="small" type="button">Refresh</button>
+          </div>
+          <div id="approvals" class="list"></div>
+        </section>
+      </section>
+
+      <section id="tab-receipts" class="tabpane hidden">
+        <section class="card">
+          <div class="card-head">
+            <h2>Receipts</h2>
+            <div class="right">
+              <button id="verify-receipts" class="small" type="button">Verify</button>
+              <button id="export-receipts" class="small" type="button">Export</button>
+              <button id="refresh-receipts" class="small" type="button">Refresh</button>
+            </div>
+          </div>
+          <div id="receipts" class="list"></div>
+        </section>
+      </section>
+
+      <section id="tab-budgets" class="tabpane hidden">
+        <section class="card">
+          <h2>Set Daily Budget (micro-USD)</h2>
+          <form id="set-budget-form">
+            <label>
+              Category
+              <input id="budget-category" name="category" type="text" required maxlength="64" />
+            </label>
+            <label>
+              Daily Limit (micro-USD)
+              <input
+                id="budget-limit"
+                name="daily_limit_microusd"
+                type="number"
+                required
+                min="0"
+                step="1"
+              />
+            </label>
+            <button type="submit">Set Budget</button>
+          </form>
+        </section>
+
+        <section class="card">
+          <div class="card-head">
+            <h2>Budgets</h2>
+            <button id="refresh-budgets" class="small" type="button">Refresh</button>
+          </div>
+          <div id="budgets" class="list"></div>
+        </section>
       </section>
     </main>
 
     <script type="module" src="dist/popup.js"></script>
   </body>
 </html>
-

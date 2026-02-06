@@ -1,28 +1,31 @@
 import { nativeCall } from "./native";
 
-type McpServerSummary = {
-  id: string;
-  endpoint_url: string;
-  has_oauth_refresh: boolean;
-};
-
-type ListMcpServersResponse = {
-  servers: McpServerSummary[];
-};
-
 type PopupRequest =
-  | { type: "load" }
-  | { type: "add_server"; server_id: string; endpoint_url: string }
-  | { type: "connect_oauth"; server_id: string; scope?: string };
+  | { type: "rpc"; method: string; params?: unknown }
+  | { type: "connect_mcp_oauth"; server_id: string; scope?: string };
 
 type PopupResponse =
-  | { ok: true; servers: McpServerSummary[] }
+  | { ok: true; result: unknown }
   | { ok: false; error: string };
 
-async function listServers(): Promise<McpServerSummary[]> {
-  const res = await nativeCall<ListMcpServersResponse>("list_mcp_servers", {});
-  return res.servers;
-}
+const ALLOWED_RPC_METHODS = new Set([
+  "health",
+  "identity",
+  "list_tools",
+  "list_providers",
+  "upsert_provider",
+  "fetch_vc",
+  "delete_provider",
+  "list_mcp_servers",
+  "upsert_mcp_server",
+  "delete_mcp_server",
+  "list_budgets",
+  "set_budget",
+  "list_approvals",
+  "approve",
+  "list_receipts",
+  "verify_receipts",
+]);
 
 function parseOAuthRedirectUrl(urlStr: string): { code: string; state: string } {
   const u = new URL(urlStr);
@@ -68,24 +71,19 @@ chrome.runtime.onMessage.addListener((msg: unknown, _sender, sendResponse) => {
 
   (async () => {
     try {
-      if (req.type === "load") {
-        const servers = await listServers();
-        sendResponse({ ok: true, servers } satisfies PopupResponse);
+      if (req.type === "rpc") {
+        if (!ALLOWED_RPC_METHODS.has(req.method)) {
+          sendResponse({ ok: false, error: "method_not_allowed" } satisfies PopupResponse);
+          return;
+        }
+        const result = await nativeCall(req.method, req.params ?? {});
+        sendResponse({ ok: true, result } satisfies PopupResponse);
         return;
       }
-      if (req.type === "add_server") {
-        await nativeCall("upsert_mcp_server", {
-          server_id: req.server_id,
-          endpoint_url: req.endpoint_url,
-        });
-        const servers = await listServers();
-        sendResponse({ ok: true, servers } satisfies PopupResponse);
-        return;
-      }
-      if (req.type === "connect_oauth") {
+      if (req.type === "connect_mcp_oauth") {
         await connectOAuth(req.server_id, req.scope);
-        const servers = await listServers();
-        sendResponse({ ok: true, servers } satisfies PopupResponse);
+        const result = await nativeCall("list_mcp_servers", {});
+        sendResponse({ ok: true, result } satisfies PopupResponse);
         return;
       }
 
@@ -100,4 +98,3 @@ chrome.runtime.onMessage.addListener((msg: unknown, _sender, sendResponse) => {
   // Keep the message channel open for async response.
   return true;
 });
-
