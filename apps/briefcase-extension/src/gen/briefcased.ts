@@ -82,6 +82,22 @@ export interface paths {
     /** Approve a pending request (returns approval token) */
     post: operations["approve"];
   };
+  "/v1/signer/pair/start": {
+    /** Start mobile signer pairing (returns pairing code) */
+    post: operations["signerPairStart"];
+  };
+  "/v1/signer/pair/{id}/complete": {
+    /** Complete mobile signer pairing using Noise PSK (no daemon auth) */
+    post: operations["signerPairComplete"];
+  };
+  "/v1/signer/approvals": {
+    /** List approvals (signer-authenticated) */
+    post: operations["signerListApprovals"];
+  };
+  "/v1/signer/approvals/{id}/approve": {
+    /** Approve an approval request (signer-authenticated) */
+    post: operations["signerApprove"];
+  };
   "/v1/receipts": {
     /** List receipts */
     get: operations["listReceipts"];
@@ -276,6 +292,35 @@ export interface components {
       /** Format: uuid */
       approval_id: string;
       approval_token: string;
+    };
+    SignerPairStartResponse: {
+      /** Format: uuid */
+      pairing_id: string;
+      /** @description Short-lived pairing code (base64url). Treat as a secret. */
+      pairing_code: string;
+      /** Format: date-time */
+      expires_at_rfc3339: string;
+    };
+    SignerPairCompleteRequest: {
+      /** @description Noise handshake message 1 (base64url). */
+      msg1_b64: string;
+      /** @description Ed25519 public key bytes (base64url). */
+      signer_pubkey_b64: string;
+      device_name?: string | null;
+    };
+    SignerPairCompleteResponse: {
+      /** @description Noise handshake message 2 (base64url). */
+      msg2_b64: string;
+    };
+    SignerSignedRequest: {
+      /** Format: uuid */
+      signer_id: string;
+      /** Format: date-time */
+      ts_rfc3339: string;
+      /** @description A unique per-request nonce (UUID string recommended). */
+      nonce: string;
+      /** @description Ed25519 signature over the request tuple (base64url). */
+      sig_b64: string;
     };
     ReceiptRecord: {
       /** Format: int64 */
@@ -730,6 +775,99 @@ export interface operations {
       };
       /** @description unauthorized */
       401: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+    };
+  };
+  /** Start mobile signer pairing (returns pairing code) */
+  signerPairStart: {
+    responses: {
+      /** @description ok */
+      200: {
+        content: {
+          "application/json": components["schemas"]["SignerPairStartResponse"];
+        };
+      };
+      /** @description unauthorized */
+      401: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+    };
+  };
+  /** Complete mobile signer pairing using Noise PSK (no daemon auth) */
+  signerPairComplete: {
+    parameters: {
+      path: {
+        id: string;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["SignerPairCompleteRequest"];
+      };
+    };
+    responses: {
+      /** @description ok */
+      200: {
+        content: {
+          "application/json": components["schemas"]["SignerPairCompleteResponse"];
+        };
+      };
+      /** @description bad request */
+      400: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+    };
+  };
+  /** List approvals (signer-authenticated) */
+  signerListApprovals: {
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["SignerSignedRequest"];
+      };
+    };
+    responses: {
+      /** @description ok */
+      200: {
+        content: {
+          "application/json": components["schemas"]["ListApprovalsResponse"];
+        };
+      };
+      /** @description bad request */
+      400: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+    };
+  };
+  /** Approve an approval request (signer-authenticated) */
+  signerApprove: {
+    parameters: {
+      path: {
+        id: string;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["SignerSignedRequest"];
+      };
+    };
+    responses: {
+      /** @description ok */
+      200: {
+        content: {
+          "application/json": components["schemas"]["ApproveResponse"];
+        };
+      };
+      /** @description bad request */
+      400: {
         content: {
           "application/json": components["schemas"]["ErrorResponse"];
         };

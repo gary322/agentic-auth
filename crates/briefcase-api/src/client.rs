@@ -19,7 +19,8 @@ use crate::types::{
     ListApprovalsResponse, ListBudgetsResponse, ListMcpServersResponse, ListProvidersResponse,
     ListReceiptsResponse, ListToolsResponse, McpOAuthExchangeRequest, McpOAuthExchangeResponse,
     McpOAuthStartRequest, McpOAuthStartResponse, McpServerSummary, OAuthExchangeRequest,
-    OAuthExchangeResponse, ProviderSummary, SetBudgetRequest, UpsertMcpServerRequest,
+    OAuthExchangeResponse, ProviderSummary, SetBudgetRequest, SignerPairCompleteRequest,
+    SignerPairCompleteResponse, SignerPairStartResponse, UpsertMcpServerRequest,
     UpsertProviderRequest, VerifyReceiptsResponse,
 };
 
@@ -165,6 +166,20 @@ impl BriefcaseClient {
         .await
     }
 
+    pub async fn signer_pair_start(&self) -> Result<SignerPairStartResponse, BriefcaseClientError> {
+        self.post_json("/v1/signer/pair/start", serde_json::json!({}))
+            .await
+    }
+
+    pub async fn signer_pair_complete(
+        &self,
+        pairing_id: &uuid::Uuid,
+        req: SignerPairCompleteRequest,
+    ) -> Result<SignerPairCompleteResponse, BriefcaseClientError> {
+        self.post_json(&format!("/v1/signer/pair/{pairing_id}/complete"), req)
+            .await
+    }
+
     pub async fn oauth_exchange(
         &self,
         provider_id: &str,
@@ -202,6 +217,22 @@ impl BriefcaseClient {
             serde_json::json!({}),
         )
         .await
+    }
+
+    pub async fn signer_list_approvals(
+        &self,
+        req: crate::types::SignerSignedRequest,
+    ) -> Result<ListApprovalsResponse, BriefcaseClientError> {
+        self.post_json("/v1/signer/approvals", req).await
+    }
+
+    pub async fn signer_approve(
+        &self,
+        id: &uuid::Uuid,
+        req: crate::types::SignerSignedRequest,
+    ) -> Result<ApproveResponse, BriefcaseClientError> {
+        self.post_json(&format!("/v1/signer/approvals/{id}/approve"), req)
+            .await
     }
 
     pub async fn list_receipts(&self) -> Result<ListReceiptsResponse, BriefcaseClientError> {

@@ -20,3 +20,6 @@ apps/briefcase-extension/playwright-report
 
 # Logs
 *.log
+
+# Local caches (e.g. docker-mounted cargo registry)
+.cache

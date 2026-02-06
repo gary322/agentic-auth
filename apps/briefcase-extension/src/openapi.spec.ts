@@ -12,6 +12,8 @@ describe("briefcased OpenAPI types", () => {
       "/v1/mcp/servers/{id}/oauth/start" extends keyof paths ? true : false;
     type HasMcpOauthExchange =
       "/v1/mcp/servers/{id}/oauth/exchange" extends keyof paths ? true : false;
+    type HasSignerPairStart =
+      "/v1/signer/pair/start" extends keyof paths ? true : false;
 
     const hasTools: HasTools = true;
     const hasCallTool: HasCallTool = true;
@@ -19,6 +21,7 @@ describe("briefcased OpenAPI types", () => {
     const hasMcpServers: HasMcpServers = true;
     const hasMcpOauthStart: HasMcpOauthStart = true;
     const hasMcpOauthExchange: HasMcpOauthExchange = true;
+    const hasSignerPairStart: HasSignerPairStart = true;
 
     // Runtime assertions are intentionally trivial; this test mainly ensures type generation stays in sync.
     expect(
@@ -27,7 +30,8 @@ describe("briefcased OpenAPI types", () => {
         hasApprovals &&
         hasMcpServers &&
         hasMcpOauthStart &&
-        hasMcpOauthExchange,
+        hasMcpOauthExchange &&
+        hasSignerPairStart,
     ).toBe(true);
   });
 });

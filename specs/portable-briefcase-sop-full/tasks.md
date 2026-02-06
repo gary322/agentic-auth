@@ -183,7 +183,7 @@ For each task, include:
 
 ## Phase 6: Mobile Signer
 
-- [ ] 6.1 Define pairing + request protocol (Noise or mTLS)
+- [x] 6.1 Define pairing + request protocol (Noise or mTLS)
   - **Do**: specify protocol; implement in Rust daemon + a simulator; ensure replay protection and device binding.
   - **Files**: `docs/PAIRING.md`, `apps/briefcased/src/pairing.rs` (new), `tests/signer_sim/*`
   - **Done when**: daemon can enroll a simulated signer and require it for approvals.

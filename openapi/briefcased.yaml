@@ -7,7 +7,8 @@ info:
 
     Security model:
     - `/health` is unauthenticated.
-    - all `/v1/*` endpoints require `Authorization: Bearer <daemon_token>`.
+    - most `/v1/*` endpoints require `Authorization: Bearer <daemon_token>`.
+    - `/v1/signer/*` endpoints use a signer pairing flow and signature-based auth (no daemon token).
 
 servers:
   - url: http://127.0.0.1:0
@@ -417,6 +418,58 @@ components:
           format: uuid
         approval_token:
           type: string
+
+    SignerPairStartResponse:
+      type: object
+      required: [pairing_id, pairing_code, expires_at_rfc3339]
+      properties:
+        pairing_id:
+          type: string
+          format: uuid
+        pairing_code:
+          type: string
+          description: Short-lived pairing code (base64url). Treat as a secret.
+        expires_at_rfc3339:
+          type: string
+          format: date-time
+
+    SignerPairCompleteRequest:
+      type: object
+      required: [msg1_b64, signer_pubkey_b64]
+      properties:
+        msg1_b64:
+          type: string
+          description: Noise handshake message 1 (base64url).
+        signer_pubkey_b64:
+          type: string
+          description: Ed25519 public key bytes (base64url).
+        device_name:
+          type: ["string", "null"]
+
+    SignerPairCompleteResponse:
+      type: object
+      required: [msg2_b64]
+      properties:
+        msg2_b64:
+          type: string
+          description: Noise handshake message 2 (base64url).
+
+    SignerSignedRequest:
+      type: object
+      required: [signer_id, ts_rfc3339, nonce, sig_b64]
+      properties:
+        signer_id:
+          type: string
+          format: uuid
+        ts_rfc3339:
+          type: string
+          format: date-time
+        nonce:
+          type: string
+          description: A unique per-request nonce (UUID string recommended).
+        sig_b64:
+          type: string
+          description: Ed25519 signature over the request tuple (base64url).
 
     ReceiptRecord:
       type: object
@@ -942,6 +995,112 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
         "401":
           description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/signer/pair/start:
+    post:
+      summary: Start mobile signer pairing (returns pairing code)
+      operationId: signerPairStart
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SignerPairStartResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/signer/pair/{id}/complete:
+    post:
+      summary: Complete mobile signer pairing using Noise PSK (no daemon auth)
+      operationId: signerPairComplete
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignerPairCompleteRequest"
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SignerPairCompleteResponse"
+        "400":
+          description: bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/signer/approvals:
+    post:
+      summary: List approvals (signer-authenticated)
+      operationId: signerListApprovals
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignerSignedRequest"
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListApprovalsResponse"
+        "400":
+          description: bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/signer/approvals/{id}/approve:
+    post:
+      summary: Approve an approval request (signer-authenticated)
+      operationId: signerApprove
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignerSignedRequest"
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApproveResponse"
+        "400":
+          description: bad request
           content:
             application/json:
               schema:

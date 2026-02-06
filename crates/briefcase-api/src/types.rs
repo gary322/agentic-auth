@@ -120,6 +120,38 @@ pub struct SetBudgetRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignerPairStartResponse {
+    pub pairing_id: Uuid,
+    /// Short-lived pairing code (base64url). Treat as a secret.
+    pub pairing_code: String,
+    pub expires_at_rfc3339: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignerPairCompleteRequest {
+    /// Noise handshake message 1 (base64url).
+    pub msg1_b64: String,
+    /// Ed25519 public key bytes (base64url).
+    pub signer_pubkey_b64: String,
+    /// Optional UI label for the signer device.
+    pub device_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignerPairCompleteResponse {
+    /// Noise handshake message 2 (base64url).
+    pub msg2_b64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignerSignedRequest {
+    pub signer_id: Uuid,
+    pub ts_rfc3339: String,
+    pub nonce: String,
+    pub sig_b64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListToolsResponse {
     pub tools: Vec<ToolSpec>,
 }

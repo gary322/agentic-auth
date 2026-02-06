@@ -118,6 +118,12 @@ impl Db {
                       created_at_rfc3339 TEXT NOT NULL
                     );
 
+                    CREATE TABLE IF NOT EXISTS signers (
+                      id                TEXT PRIMARY KEY,
+                      pubkey_b64         TEXT NOT NULL,
+                      created_at_rfc3339 TEXT NOT NULL
+                    );
+
                     CREATE TABLE IF NOT EXISTS vcs (
                       provider_id           TEXT PRIMARY KEY,
                       vc_jwt                TEXT NOT NULL,
@@ -736,6 +742,55 @@ impl Db {
             })
             .await?;
         Ok(())
+    }
+
+    pub async fn upsert_signer(&self, signer_id: Uuid, pubkey_b64: &str) -> anyhow::Result<()> {
+        let signer_id = signer_id.to_string();
+        let pubkey_b64 = pubkey_b64.to_string();
+        let created_at = Utc::now().to_rfc3339();
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    r#"
+                    INSERT INTO signers(id, pubkey_b64, created_at_rfc3339)
+                    VALUES (?1, ?2, ?3)
+                    ON CONFLICT(id) DO UPDATE SET pubkey_b64=excluded.pubkey_b64
+                    "#,
+                    params![signer_id, pubkey_b64, created_at],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn signer_pubkey_b64(&self, signer_id: Uuid) -> anyhow::Result<Option<String>> {
+        let signer_id = signer_id.to_string();
+        let row = self
+            .conn
+            .call(move |conn| {
+                let row = conn
+                    .query_row(
+                        "SELECT pubkey_b64 FROM signers WHERE id=?1",
+                        params![signer_id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?;
+                Ok(row)
+            })
+            .await?;
+        Ok(row)
+    }
+
+    pub async fn has_any_signers(&self) -> anyhow::Result<bool> {
+        let n: i64 = self
+            .conn
+            .call(|conn| {
+                let n: i64 = conn.query_row("SELECT COUNT(*) FROM signers", [], |r| r.get(0))?;
+                Ok(n)
+            })
+            .await?;
+        Ok(n > 0)
     }
 
     pub async fn upsert_vc(

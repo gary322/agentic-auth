@@ -15,7 +15,8 @@ use briefcase_api::types::{
     ListApprovalsResponse, ListBudgetsResponse, ListMcpServersResponse, ListProvidersResponse,
     ListReceiptsResponse, ListToolsResponse, McpOAuthExchangeRequest, McpOAuthExchangeResponse,
     McpOAuthStartRequest, McpOAuthStartResponse, OAuthExchangeRequest, OAuthExchangeResponse,
-    ProviderSummary, SetBudgetRequest, UpsertMcpServerRequest, UpsertProviderRequest,
+    ProviderSummary, SetBudgetRequest, SignerPairCompleteRequest, SignerPairCompleteResponse,
+    SignerPairStartResponse, SignerSignedRequest, UpsertMcpServerRequest, UpsertProviderRequest,
     VerifyReceiptsResponse,
 };
 use briefcase_core::{
@@ -31,6 +32,7 @@ use uuid::Uuid;
 
 use crate::db::Db;
 use crate::middleware::require_auth;
+use crate::pairing::{PairingManager, SignerReplayCache};
 use crate::provider::ProviderClient;
 use crate::remote_mcp::RemoteMcpManager;
 use crate::tools::ToolRegistry;
@@ -39,6 +41,11 @@ use briefcase_policy::{CedarPolicyEngine, CedarPolicyEngineOptions};
 use briefcase_receipts::{ReceiptStore, ReceiptStoreOptions};
 use briefcase_secrets::SecretStore;
 use std::sync::Arc;
+
+#[derive(Debug, Clone, Default)]
+pub struct AppOptions {
+    pub require_signer_for_approvals: bool,
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -52,6 +59,9 @@ pub struct AppState {
     pub remote_mcp: Arc<RemoteMcpManager>,
     pub secrets: Arc<dyn SecretStore>,
     pub identity_did: String,
+    pub pairing: Arc<PairingManager>,
+    pub signer_replay: Arc<SignerReplayCache>,
+    pub require_signer_for_approvals: bool,
 }
 
 impl AppState {
@@ -60,6 +70,23 @@ impl AppState {
         auth_token: String,
         provider_base_url: String,
         secrets: Arc<dyn SecretStore>,
+    ) -> anyhow::Result<Self> {
+        Self::init_with_options(
+            db_path,
+            auth_token,
+            provider_base_url,
+            secrets,
+            AppOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn init_with_options(
+        db_path: &Path,
+        auth_token: String,
+        provider_base_url: String,
+        secrets: Arc<dyn SecretStore>,
+        opts: AppOptions,
     ) -> anyhow::Result<Self> {
         let db = Db::open(db_path).await?;
         db.init().await?;
@@ -198,6 +225,9 @@ impl AppState {
         let provider = ProviderClient::new(secrets.clone(), db.clone(), pop_signer, payments);
         let tools = ToolRegistry::new(provider, db.clone());
 
+        let pairing = Arc::new(PairingManager::new(std::time::Duration::from_secs(300)));
+        let signer_replay = Arc::new(SignerReplayCache::new(std::time::Duration::from_secs(600)));
+
         Ok(Self {
             auth_token,
             db,
@@ -209,6 +239,9 @@ impl AppState {
             remote_mcp,
             secrets,
             identity_did,
+            pairing,
+            signer_replay,
+            require_signer_for_approvals: opts.require_signer_for_approvals,
         })
     }
 }
@@ -266,6 +299,7 @@ fn router(state: AppState) -> Router {
         .route("/v1/tools/call", post(call_tool))
         .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{id}/approve", post(approve))
+        .route("/v1/signer/pair/start", post(start_signer_pairing))
         .route("/v1/receipts", get(list_receipts))
         .route("/v1/receipts/verify", post(verify_receipts))
         .layer(axum::middleware::from_fn_with_state(
@@ -273,9 +307,18 @@ fn router(state: AppState) -> Router {
             require_auth,
         ));
 
+    let signer = Router::new()
+        .route(
+            "/v1/signer/pair/{id}/complete",
+            post(complete_signer_pairing),
+        )
+        .route("/v1/signer/approvals", post(signer_list_approvals))
+        .route("/v1/signer/approvals/{id}/approve", post(signer_approve));
+
     Router::new()
         .route("/health", get(health))
         .merge(authed)
+        .merge(signer)
         .with_state(state)
 }
 
@@ -1231,6 +1274,18 @@ async fn approve(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<Uuid>,
 ) -> Result<Json<ApproveResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if state.require_signer_for_approvals
+        && state.db.has_any_signers().await.map_err(internal_error)?
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                code: "signer_required".to_string(),
+                message: "mobile signer required".to_string(),
+            }),
+        ));
+    }
+
     match state.db.approve(id).await {
         Ok(Some(token)) => Ok(Json(ApproveResponse {
             approval_id: id,
@@ -1254,6 +1309,170 @@ async fn approve(
             ))
         }
     }
+}
+
+async fn start_signer_pairing(State(state): State<AppState>) -> Json<SignerPairStartResponse> {
+    let (pairing_id, pairing_code, _expires_at) = state.pairing.start().await;
+    let expires_at_rfc3339 = (Utc::now()
+        + chrono::Duration::from_std(state.pairing.ttl()).unwrap_or_default())
+    .to_rfc3339();
+    Json(SignerPairStartResponse {
+        pairing_id,
+        pairing_code,
+        expires_at_rfc3339,
+    })
+}
+
+async fn complete_signer_pairing(
+    State(state): State<AppState>,
+    AxumPath(pairing_id): AxumPath<Uuid>,
+    Json(req): Json<SignerPairCompleteRequest>,
+) -> Result<Json<SignerPairCompleteResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let psk = state
+        .pairing
+        .get_psk(pairing_id)
+        .await
+        .ok_or_else(|| not_found("pairing_not_found"))?;
+
+    let msg1 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(req.msg1_b64.as_bytes())
+        .map_err(|_| bad_request("invalid_msg1_b64"))?;
+
+    let signer_pubkey = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(req.signer_pubkey_b64.as_bytes())
+        .map_err(|_| bad_request("invalid_signer_pubkey_b64"))?;
+    if signer_pubkey.len() != 32 {
+        return Err(bad_request("invalid_signer_pubkey_len"));
+    }
+
+    let mut pubkey_arr = [0u8; 32];
+    pubkey_arr.copy_from_slice(&signer_pubkey);
+    let _vk = ed25519_dalek::VerifyingKey::from_bytes(&pubkey_arr)
+        .map_err(|_| bad_request("invalid_signer_pubkey"))?;
+
+    let pubkey_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signer_pubkey);
+
+    let mut noise = crate::pairing::noise_responder(&psk).map_err(internal_error)?;
+    let mut payload = vec![0u8; 1024];
+    let _ = noise
+        .read_message(&msg1, &mut payload)
+        .map_err(|_| bad_request("invalid_noise_msg1"))?;
+
+    let signer_id = Uuid::new_v4();
+    state
+        .db
+        .upsert_signer(signer_id, &pubkey_b64)
+        .await
+        .map_err(internal_error)?;
+
+    let msg2_payload = serde_json::to_vec(&serde_json::json!({
+        "signer_id": signer_id.to_string(),
+        "ts": Utc::now().to_rfc3339(),
+    }))
+    .map_err(internal_error)?;
+
+    let mut msg2 = vec![0u8; 1024];
+    let msg2_len = noise
+        .write_message(&msg2_payload, &mut msg2)
+        .map_err(|_| internal_error("noise_write_failed"))?;
+    msg2.truncate(msg2_len);
+
+    state.pairing.consume(pairing_id).await;
+
+    Ok(Json(SignerPairCompleteResponse {
+        msg2_b64: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(msg2),
+    }))
+}
+
+async fn signer_list_approvals(
+    State(state): State<AppState>,
+    Json(req): Json<SignerSignedRequest>,
+) -> Result<Json<ListApprovalsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    verify_signer_request(&state, "list_approvals", None, &req).await?;
+    let approvals = state.db.list_approvals().await.map_err(internal_error)?;
+    Ok(Json(ListApprovalsResponse { approvals }))
+}
+
+async fn signer_approve(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(req): Json<SignerSignedRequest>,
+) -> Result<Json<ApproveResponse>, (StatusCode, Json<ErrorResponse>)> {
+    verify_signer_request(&state, "approve", Some(id), &req).await?;
+
+    match state.db.approve(id).await {
+        Ok(Some(token)) => Ok(Json(ApproveResponse {
+            approval_id: id,
+            approval_token: token,
+        })),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                code: "not_found".to_string(),
+                message: "approval not found".to_string(),
+            }),
+        )),
+        Err(e) => {
+            error!(error = %e, "signer approve failed");
+            Err(internal_error(e))
+        }
+    }
+}
+
+async fn verify_signer_request(
+    state: &AppState,
+    kind: &str,
+    approval_id: Option<Uuid>,
+    req: &SignerSignedRequest,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let pk_b64 = state
+        .db
+        .signer_pubkey_b64(req.signer_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| not_found("unknown_signer"))?;
+
+    let pk = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(pk_b64.as_bytes())
+        .map_err(|_| bad_request("invalid_signer_pubkey_b64"))?;
+    if pk.len() != 32 {
+        return Err(bad_request("invalid_signer_pubkey_len"));
+    }
+    let mut pk_arr = [0u8; 32];
+    pk_arr.copy_from_slice(&pk);
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk_arr)
+        .map_err(|_| bad_request("invalid_signer_pubkey"))?;
+
+    let ts = chrono::DateTime::parse_from_rfc3339(&req.ts_rfc3339)
+        .map_err(|_| bad_request("invalid_ts"))?
+        .with_timezone(&Utc);
+    let skew = (Utc::now() - ts).num_seconds().abs();
+    if skew > 120 {
+        return Err(bad_request("timestamp_skew"));
+    }
+
+    let replay_key = format!("{}:{}", req.signer_id, req.nonce);
+    if !state.signer_replay.check_and_insert(replay_key).await {
+        return Err(bad_request("replay"));
+    }
+
+    let sig_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(req.sig_b64.as_bytes())
+        .map_err(|_| bad_request("invalid_sig_b64"))?;
+    let sig =
+        ed25519_dalek::Signature::from_slice(&sig_bytes).map_err(|_| bad_request("invalid_sig"))?;
+
+    let approval_line = approval_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let msg = format!(
+        "{kind}\n{}\n{}\n{}\n{}\n",
+        req.signer_id, approval_line, req.ts_rfc3339, req.nonce
+    );
+    vk.verify_strict(msg.as_bytes(), &sig)
+        .map_err(|_| bad_request("invalid_signature"))?;
+
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1492,9 +1711,16 @@ mod tests {
     use super::*;
 
     use briefcase_api::types::CallToolRequest;
-    use briefcase_api::{BriefcaseClient, DaemonEndpoint};
+    use briefcase_api::{BriefcaseClient, BriefcaseClientError, DaemonEndpoint};
     use briefcase_core::ToolCallContext;
     use tempfile::tempdir;
+
+    mod signer_sim {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/signer_sim/sim.rs"
+        ));
+    }
 
     #[derive(Clone)]
     struct MockRemoteMcpState {
@@ -2446,8 +2672,9 @@ mod tests {
         Ok((addr, st, handle))
     }
 
-    async fn start_daemon(
+    async fn start_daemon_with_options(
         provider_base_url: String,
+        opts: AppOptions,
     ) -> anyhow::Result<(
         AppState,
         String,
@@ -2459,8 +2686,14 @@ mod tests {
         let auth_token = "test-token";
 
         let secrets = Arc::new(briefcase_secrets::InMemorySecretStore::default());
-        let state =
-            AppState::init(&db_path, auth_token.to_string(), provider_base_url, secrets).await?;
+        let state = AppState::init_with_options(
+            &db_path,
+            auth_token.to_string(),
+            provider_base_url,
+            secrets,
+            opts,
+        )
+        .await?;
         let app = router(state.clone());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -2482,6 +2715,17 @@ mod tests {
         std::mem::forget(dir);
 
         Ok((state, base_url, client, handle))
+    }
+
+    async fn start_daemon(
+        provider_base_url: String,
+    ) -> anyhow::Result<(
+        AppState,
+        String,
+        BriefcaseClient,
+        tokio::task::JoinHandle<()>,
+    )> {
+        start_daemon_with_options(provider_base_url, AppOptions::default()).await
     }
 
     #[tokio::test]
@@ -2558,6 +2802,86 @@ mod tests {
         // Receipts exist.
         let receipts = client.list_receipts().await?.receipts;
         assert!(!receipts.is_empty());
+
+        daemon_task.abort();
+        provider_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signer_pairing_and_approval_flow() -> anyhow::Result<()> {
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let (_state, _daemon_base, client, daemon_task) = start_daemon_with_options(
+            provider_base_url,
+            AppOptions {
+                require_signer_for_approvals: true,
+            },
+        )
+        .await?;
+
+        let pair = client.signer_pair_start().await?;
+        let sim = signer_sim::SimSigner::new();
+        let signer_id = sim
+            .pair(&client, pair.pairing_id, &pair.pairing_code)
+            .await?;
+
+        // note_add requires approval.
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "note_add".to_string(),
+                    args: serde_json::json!({ "text": "secret note" }),
+                    context: ToolCallContext::new(),
+                    approval_token: None,
+                },
+            })
+            .await?;
+
+        let approval_id = match resp {
+            CallToolResponse::ApprovalRequired { approval } => approval.id,
+            _ => anyhow::bail!("expected approval_required"),
+        };
+
+        // Signer can list approvals.
+        let approvals = client
+            .signer_list_approvals(sim.signed_request(signer_id, "list_approvals", None))
+            .await?
+            .approvals;
+        assert!(
+            approvals.iter().any(|a| a.id == approval_id),
+            "approval not found in signer list"
+        );
+
+        // Normal approve is blocked when signer enforcement is enabled.
+        match client.approve(&approval_id).await {
+            Ok(_) => anyhow::bail!("expected signer_required error"),
+            Err(BriefcaseClientError::Daemon { code, .. }) => {
+                assert_eq!(code, "signer_required");
+            }
+            Err(other) => anyhow::bail!("unexpected error: {other:?}"),
+        };
+
+        let approved = client
+            .signer_approve(
+                &approval_id,
+                sim.signed_request(signer_id, "approve", Some(approval_id)),
+            )
+            .await?;
+
+        // Retry with approval token.
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "note_add".to_string(),
+                    args: serde_json::json!({ "text": "secret note" }),
+                    context: ToolCallContext::new(),
+                    approval_token: Some(approved.approval_token),
+                },
+            })
+            .await?;
+        assert!(matches!(resp, CallToolResponse::Ok { .. }));
 
         daemon_task.abort();
         provider_task.abort();
