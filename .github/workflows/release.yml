@@ -25,13 +25,8 @@ jobs:
           toolchain: "1.89.0"
 
       - name: Build
-        run: |
-          cargo build --release \
-            -p briefcased \
-            -p briefcase-cli \
-            -p mcp-gateway \
-            -p agent-access-gateway \
-            -p briefcase-ui
+        # Keep this a single line so it runs under both bash (unix) and pwsh (Windows).
+        run: cargo build --release -p briefcased -p briefcase-cli -p mcp-gateway -p agent-access-gateway -p briefcase-ui
 
       - name: Package (unix)
         if: runner.os != 'Windows'
