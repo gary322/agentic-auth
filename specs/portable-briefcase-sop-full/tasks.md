@@ -143,11 +143,11 @@ For each task, include:
   - **Done when**: CI can run sign/verify via swtpm.
   - **Verify**: `just test-tpm2`
 
-- [ ] 4.4 Implement Apple Keychain/Secure Enclave backend (macOS/iOS)
+- [x] 4.4 Implement Apple Keychain/Secure Enclave backend (macOS/iOS)
   - **Do**: use Apple Security framework to create P-256 secure enclave keys; fallback to Keychain when SE unavailable.
   - **Files**: `crates/briefcase-keys/src/apple.rs`
   - **Done when**: macOS integration test passes on environments that support it; fallback works elsewhere.
-  - **Verify**: `cargo test -p briefcase-keys apple_*`
+  - **Verify**: `cargo test -p briefcase-keys --features apple apple_*`
 
 - [ ] 4.5 Implement Windows CNG/NCrypt backend (TPM where possible)
   - **Do**: implement CNG signer; detect TPM provider; fallback to software key.

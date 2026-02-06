@@ -7,6 +7,7 @@ repository.workspace = true
 
 [features]
 default = []
+apple = ["dep:tokio"]
 pkcs11 = ["dep:cryptoki", "dep:tokio"]
 tpm2 = ["dep:tempfile", "dep:tokio"]
 
@@ -30,6 +31,9 @@ zeroize.workspace = true
 
 briefcase-core = { path = "../briefcase-core" }
 briefcase-secrets = { path = "../briefcase-secrets" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

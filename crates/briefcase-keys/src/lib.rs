@@ -8,6 +8,9 @@
 #[cfg(feature = "pkcs11")]
 pub mod pkcs11;
 
+#[cfg(all(feature = "apple", target_os = "macos"))]
+pub mod apple;
+
 #[cfg(feature = "tpm2")]
 pub mod tpm2;
 
