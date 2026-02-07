@@ -372,7 +372,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/SHA256SUMS.txt
             dist/**/*.tar.gz
             dist/**/*.tar.gz.sig
             dist/**/*.tar.gz.crt
