@@ -252,7 +252,7 @@ For each task, include:
   - **Verify**: integration tests.
   - _Reqs: FR-10_
 
-- [ ] 9.2 VC status list verification
+- [x] 9.2 VC status list verification
   - **Do**: implement status-list fetch and checks; safe caching; fail-closed vs require-approval policy knob.
   - **Files**: `crates/briefcase-revocation/*`, `apps/briefcased/src/provider.rs`
   - **Done when**: revoked VCs are rejected and logged/receipted.

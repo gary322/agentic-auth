@@ -56,6 +56,39 @@ pub struct OAuthSessionRecord {
     pub token_endpoint: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct VcUpsert {
+    pub vc_jwt: String,
+    pub expires_at: DateTime<Utc>,
+    pub status_list_url: Option<String>,
+    pub status_list_index: Option<i64>,
+    pub status_purpose: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct VcRecord {
+    pub provider_id: String,
+    pub vc_jwt: String,
+    pub expires_at: DateTime<Utc>,
+    pub status_list_url: Option<String>,
+    pub status_list_index: Option<i64>,
+    pub status_purpose: Option<String>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VcStatusListCacheRecord {
+    pub url: String,
+    pub encoded_list: String,
+    pub status_purpose: String,
+    pub status_size: i64,
+    pub ttl_ms: Option<i64>,
+    pub etag: Option<String>,
+    pub fetched_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
 impl Db {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
@@ -133,8 +166,25 @@ impl Db {
                       provider_id           TEXT PRIMARY KEY,
                       vc_jwt                TEXT NOT NULL,
                       expires_at_rfc3339    TEXT NOT NULL,
+                      status_list_url       TEXT,
+                      status_list_index     INTEGER,
+                      status_purpose        TEXT,
+                      revoked_at_rfc3339    TEXT,
                       created_at_rfc3339    TEXT NOT NULL
                     );
+
+                    CREATE TABLE IF NOT EXISTS vc_status_lists (
+                      url                 TEXT PRIMARY KEY,
+                      encoded_list        TEXT NOT NULL,
+                      status_purpose      TEXT NOT NULL,
+                      status_size         INTEGER NOT NULL,
+                      ttl_ms              INTEGER,
+                      etag                TEXT,
+                      fetched_at_rfc3339  TEXT NOT NULL,
+                      expires_at_rfc3339  TEXT NOT NULL
+                    );
+
+                    CREATE INDEX IF NOT EXISTS vc_status_lists_expires_idx ON vc_status_lists(expires_at_rfc3339);
 
                     CREATE TABLE IF NOT EXISTS remote_mcp_servers (
                       id                TEXT PRIMARY KEY,
@@ -203,6 +253,10 @@ impl Db {
                     "ALTER TABLE remote_mcp_oauth ADD COLUMN revocation_endpoint TEXT",
                     [],
                 );
+                let _ = conn.execute("ALTER TABLE vcs ADD COLUMN status_list_url TEXT", []);
+                let _ = conn.execute("ALTER TABLE vcs ADD COLUMN status_list_index INTEGER", []);
+                let _ = conn.execute("ALTER TABLE vcs ADD COLUMN status_purpose TEXT", []);
+                let _ = conn.execute("ALTER TABLE vcs ADD COLUMN revoked_at_rfc3339 TEXT", []);
                 let _ = conn.execute(
                     "ALTER TABLE approvals ADD COLUMN approval_kind TEXT NOT NULL DEFAULT 'local'",
                     [],
@@ -829,25 +883,37 @@ impl Db {
         Ok(n > 0)
     }
 
-    pub async fn upsert_vc(
-        &self,
-        provider_id: &str,
-        vc_jwt: &str,
-        expires_at: DateTime<Utc>,
-    ) -> anyhow::Result<()> {
+    pub async fn upsert_vc(&self, provider_id: &str, vc: VcUpsert) -> anyhow::Result<()> {
         let provider_id = provider_id.to_string();
-        let vc_jwt = vc_jwt.to_string();
-        let expires_at_rfc3339 = expires_at.to_rfc3339();
+        let vc_jwt = vc.vc_jwt;
+        let expires_at_rfc3339 = vc.expires_at.to_rfc3339();
+        let status_list_url = vc.status_list_url;
+        let status_list_index = vc.status_list_index;
+        let status_purpose = vc.status_purpose;
         let created_at = Utc::now().to_rfc3339();
         self.conn
             .call(move |conn| {
                 conn.execute(
                     r#"
-                    INSERT INTO vcs(provider_id, vc_jwt, expires_at_rfc3339, created_at_rfc3339)
-                    VALUES (?1, ?2, ?3, ?4)
-                    ON CONFLICT(provider_id) DO UPDATE SET vc_jwt=excluded.vc_jwt, expires_at_rfc3339=excluded.expires_at_rfc3339
+                    INSERT INTO vcs(provider_id, vc_jwt, expires_at_rfc3339, status_list_url, status_list_index, status_purpose, revoked_at_rfc3339, created_at_rfc3339)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)
+                    ON CONFLICT(provider_id) DO UPDATE SET
+                      vc_jwt=excluded.vc_jwt,
+                      expires_at_rfc3339=excluded.expires_at_rfc3339,
+                      status_list_url=excluded.status_list_url,
+                      status_list_index=excluded.status_list_index,
+                      status_purpose=excluded.status_purpose,
+                      revoked_at_rfc3339=NULL
                     "#,
-                    params![provider_id, vc_jwt, expires_at_rfc3339, created_at],
+                    params![
+                        provider_id,
+                        vc_jwt,
+                        expires_at_rfc3339,
+                        status_list_url,
+                        status_list_index,
+                        status_purpose,
+                        created_at
+                    ],
                 )?;
                 Ok(())
             })
@@ -865,7 +931,7 @@ impl Db {
             .call(move |conn| {
                 let row = conn
                     .query_row(
-                        "SELECT vc_jwt, expires_at_rfc3339 FROM vcs WHERE provider_id=?1",
+                        "SELECT vc_jwt, expires_at_rfc3339 FROM vcs WHERE provider_id=?1 AND revoked_at_rfc3339 IS NULL",
                         params![provider_id],
                         |row| {
                             let vc_jwt: String = row.get(0)?;
@@ -887,6 +953,202 @@ impl Db {
             }
             None => Ok(None),
         }
+    }
+
+    pub async fn vc_record(&self, provider_id: &str) -> anyhow::Result<Option<VcRecord>> {
+        let provider_id = provider_id.to_string();
+        let row = self
+            .conn
+            .call(move |conn| {
+                let row = conn
+                    .query_row(
+                        "SELECT provider_id, vc_jwt, expires_at_rfc3339, status_list_url, status_list_index, status_purpose, revoked_at_rfc3339 FROM vcs WHERE provider_id=?1",
+                        params![provider_id],
+                        |row| {
+                            let provider_id: String = row.get(0)?;
+                            let vc_jwt: String = row.get(1)?;
+                            let expires_at: String = row.get(2)?;
+                            let status_list_url: Option<String> = row.get(3)?;
+                            let status_list_index: Option<i64> = row.get(4)?;
+                            let status_purpose: Option<String> = row.get(5)?;
+                            let revoked_at: Option<String> = row.get(6)?;
+                            Ok((
+                                provider_id,
+                                vc_jwt,
+                                expires_at,
+                                status_list_url,
+                                status_list_index,
+                                status_purpose,
+                                revoked_at,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                Ok(row)
+            })
+            .await?;
+
+        let Some((
+            provider_id,
+            vc_jwt,
+            expires_at_rfc3339,
+            status_list_url,
+            status_list_index,
+            status_purpose,
+            revoked_at_rfc3339,
+        )) = row
+        else {
+            return Ok(None);
+        };
+
+        let expires_at = DateTime::parse_from_rfc3339(&expires_at_rfc3339)
+            .with_context(|| "parse vc expiry")?
+            .with_timezone(&Utc);
+        let revoked_at = match revoked_at_rfc3339 {
+            Some(s) => Some(
+                DateTime::parse_from_rfc3339(&s)
+                    .with_context(|| "parse vc revoked_at")?
+                    .with_timezone(&Utc),
+            ),
+            None => None,
+        };
+
+        Ok(Some(VcRecord {
+            provider_id,
+            vc_jwt,
+            expires_at,
+            status_list_url,
+            status_list_index,
+            status_purpose,
+            revoked_at,
+        }))
+    }
+
+    pub async fn mark_vc_revoked(
+        &self,
+        provider_id: &str,
+        revoked_at: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        let provider_id = provider_id.to_string();
+        let revoked_at_rfc3339 = revoked_at.to_rfc3339();
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE vcs SET revoked_at_rfc3339=?2 WHERE provider_id=?1",
+                    params![provider_id, revoked_at_rfc3339],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_vc_status_list_cache(
+        &self,
+        url: &str,
+    ) -> anyhow::Result<Option<VcStatusListCacheRecord>> {
+        let url = url.to_string();
+        let row = self
+            .conn
+            .call(move |conn| {
+                let row = conn
+                    .query_row(
+                        "SELECT url, encoded_list, status_purpose, status_size, ttl_ms, etag, fetched_at_rfc3339, expires_at_rfc3339 FROM vc_status_lists WHERE url=?1",
+                        params![url],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, i64>(3)?,
+                                row.get::<_, Option<i64>>(4)?,
+                                row.get::<_, Option<String>>(5)?,
+                                row.get::<_, String>(6)?,
+                                row.get::<_, String>(7)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                Ok(row)
+            })
+            .await?;
+
+        let Some((
+            url,
+            encoded_list,
+            status_purpose,
+            status_size,
+            ttl_ms,
+            etag,
+            fetched_at_rfc3339,
+            expires_at_rfc3339,
+        )) = row
+        else {
+            return Ok(None);
+        };
+
+        let fetched_at = DateTime::parse_from_rfc3339(&fetched_at_rfc3339)
+            .with_context(|| "parse status list fetched_at")?
+            .with_timezone(&Utc);
+        let expires_at = DateTime::parse_from_rfc3339(&expires_at_rfc3339)
+            .with_context(|| "parse status list expires_at")?
+            .with_timezone(&Utc);
+
+        Ok(Some(VcStatusListCacheRecord {
+            url,
+            encoded_list,
+            status_purpose,
+            status_size,
+            ttl_ms,
+            etag,
+            fetched_at,
+            expires_at,
+        }))
+    }
+
+    pub async fn upsert_vc_status_list_cache(
+        &self,
+        rec: VcStatusListCacheRecord,
+    ) -> anyhow::Result<()> {
+        let url = rec.url;
+        let encoded_list = rec.encoded_list;
+        let status_purpose = rec.status_purpose;
+        let status_size = rec.status_size;
+        let ttl_ms = rec.ttl_ms;
+        let etag = rec.etag;
+        let fetched_at_rfc3339 = rec.fetched_at.to_rfc3339();
+        let expires_at_rfc3339 = rec.expires_at.to_rfc3339();
+
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    r#"
+                    INSERT INTO vc_status_lists(url, encoded_list, status_purpose, status_size, ttl_ms, etag, fetched_at_rfc3339, expires_at_rfc3339)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    ON CONFLICT(url) DO UPDATE SET
+                      encoded_list=excluded.encoded_list,
+                      status_purpose=excluded.status_purpose,
+                      status_size=excluded.status_size,
+                      ttl_ms=excluded.ttl_ms,
+                      etag=excluded.etag,
+                      fetched_at_rfc3339=excluded.fetched_at_rfc3339,
+                      expires_at_rfc3339=excluded.expires_at_rfc3339
+                    "#,
+                    params![
+                        url,
+                        encoded_list,
+                        status_purpose,
+                        status_size,
+                        ttl_ms,
+                        etag,
+                        fetched_at_rfc3339,
+                        expires_at_rfc3339
+                    ],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
     }
 
     pub async fn list_note_ids(&self, limit: usize) -> anyhow::Result<Vec<i64>> {

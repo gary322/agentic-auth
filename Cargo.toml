@@ -16,6 +16,7 @@ members = [
   "crates/briefcase-mcp",
   "crates/briefcase-oauth-discovery",
   "crates/briefcase-payments",
+  "crates/briefcase-revocation",
   "crates/briefcase-risk",
   "crates/briefcase-sandbox",
   "crates/briefcase-policy",
@@ -44,6 +45,7 @@ clap = { version = "4.5.31", features = ["derive", "env"] }
 cryptoki = "0.12.0"
 directories = "6.0.0"
 ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std"] }
+flate2 = "1.1.2"
 hex = "0.4.3"
 hmac = "0.12.1"
 http = "1.2.0"

@@ -36,3 +36,12 @@ Budgets are enforced in `briefcased`:
   - `read`: $3/day
   - `write`: $0/day (forces approval for any paid write tool)
   - `admin`: $0/day
+
+## VC Revocation (Status Unknown)
+
+If a stored VC includes a Bitstring Status List entry and the status list cannot be fetched/parsed, `briefcased` treats the status as **unknown** and applies one of two behaviors:
+
+- `require_approval` (default): return `approval_required` for the tool call.
+- `deny`: fail closed with `denied` (`reason=vc_status_unknown`).
+
+Configure via `BRIEFCASE_VC_STATUS_UNKNOWN_MODE`.

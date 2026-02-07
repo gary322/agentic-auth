@@ -125,6 +125,7 @@ pub enum ApprovalKind {
 #[serde(rename_all = "snake_case")]
 pub enum AuthMethod {
     None,
+    #[serde(rename = "oauth")]
     OAuth,
     Vc,
     CapabilityToken,

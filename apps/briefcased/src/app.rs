@@ -46,6 +46,35 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Default)]
 pub struct AppOptions {
     pub require_signer_for_approvals: bool,
+    pub vc_status_unknown_mode: VcStatusUnknownMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VcStatusUnknownMode {
+    Deny,
+    RequireApproval,
+}
+
+impl Default for VcStatusUnknownMode {
+    fn default() -> Self {
+        Self::RequireApproval
+    }
+}
+
+impl VcStatusUnknownMode {
+    fn parse_env(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("deny") {
+            return Some(Self::Deny);
+        }
+        if s.eq_ignore_ascii_case("require_approval")
+            || s.eq_ignore_ascii_case("approval")
+            || s.eq_ignore_ascii_case("approve")
+        {
+            return Some(Self::RequireApproval);
+        }
+        None
+    }
 }
 
 #[derive(Clone)]
@@ -55,6 +84,7 @@ pub struct AppState {
     pub receipts: ReceiptStore,
     pub policy: Arc<CedarPolicyEngine>,
     pub risk: Arc<briefcase_risk::RiskEngine>,
+    pub http: reqwest::Client,
     pub provider: Arc<ProviderClient>,
     pub tools: ToolRegistry,
     pub oauth_discovery: Arc<briefcase_oauth_discovery::OAuthDiscoveryClient>,
@@ -64,6 +94,7 @@ pub struct AppState {
     pub pairing: Arc<PairingManager>,
     pub signer_replay: Arc<SignerReplayCache>,
     pub require_signer_for_approvals: bool,
+    pub vc_status_unknown_mode: VcStatusUnknownMode,
 }
 
 impl AppState {
@@ -131,6 +162,12 @@ impl AppState {
             }
         }
         let risk = Arc::new(briefcase_risk::RiskEngine::new(classifier_url)?);
+
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("build http client")?;
 
         let oauth_discovery = Arc::new(briefcase_oauth_discovery::OAuthDiscoveryClient::new(
             std::time::Duration::from_secs(300),
@@ -235,12 +272,19 @@ impl AppState {
         let pairing = Arc::new(PairingManager::new(std::time::Duration::from_secs(300)));
         let signer_replay = Arc::new(SignerReplayCache::new(std::time::Duration::from_secs(600)));
 
+        let vc_status_unknown_mode = std::env::var("BRIEFCASE_VC_STATUS_UNKNOWN_MODE")
+            .ok()
+            .as_deref()
+            .and_then(VcStatusUnknownMode::parse_env)
+            .unwrap_or(opts.vc_status_unknown_mode);
+
         Ok(Self {
             auth_token,
             db,
             receipts,
             policy,
             risk,
+            http,
             provider,
             tools,
             oauth_discovery,
@@ -250,6 +294,7 @@ impl AppState {
             pairing,
             signer_replay,
             require_signer_for_approvals: opts.require_signer_for_approvals,
+            vc_status_unknown_mode,
         })
     }
 }
@@ -1080,6 +1125,410 @@ async fn call_tool(
     }
 }
 
+const DEFAULT_VC_STATUS_LIST_TTL_MS: u64 = 300_000;
+const MAX_VC_STATUS_LIST_DOC_BYTES: usize = 1024 * 1024;
+
+async fn preflight_vc_status_check(
+    state: &AppState,
+    call: &ToolCall,
+    runtime: &str,
+) -> anyhow::Result<Option<CallToolResponse>> {
+    if call.tool_id != "quote" {
+        return Ok(None);
+    }
+
+    let provider_id = call
+        .args
+        .get("provider_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("demo")
+        .to_string();
+
+    let Some(vc) = state.db.vc_record(&provider_id).await? else {
+        return Ok(None);
+    };
+    if vc.revoked_at.is_some() || Utc::now() >= vc.expires_at {
+        return Ok(None);
+    }
+
+    let entry = match (
+        vc.status_list_url.as_ref(),
+        vc.status_list_index,
+        vc.status_purpose.as_ref(),
+    ) {
+        (Some(url_s), Some(idx), Some(purpose)) => {
+            let status_list_credential = match url::Url::parse(url_s) {
+                Ok(u) => u,
+                Err(e) => {
+                    return handle_unknown_vc_status(
+                        state,
+                        call,
+                        runtime,
+                        &provider_id,
+                        "vc_status_bad_url",
+                        &e.to_string(),
+                    )
+                    .await;
+                }
+            };
+            let status_list_index = match usize::try_from(idx) {
+                Ok(v) => v,
+                Err(_) => {
+                    return handle_unknown_vc_status(
+                        state,
+                        call,
+                        runtime,
+                        &provider_id,
+                        "vc_status_bad_index",
+                        "status_list_index out of range",
+                    )
+                    .await;
+                }
+            };
+            briefcase_revocation::BitstringStatusListEntry {
+                status_purpose: purpose.to_string(),
+                status_list_index,
+                status_list_credential,
+            }
+        }
+        _ => match briefcase_revocation::BitstringStatusListEntry::parse_from_vc_jwt(&vc.vc_jwt) {
+            Ok(Some(e)) => e,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                return handle_unknown_vc_status(
+                    state,
+                    call,
+                    runtime,
+                    &provider_id,
+                    "vc_status_parse_failed",
+                    &e.to_string(),
+                )
+                .await;
+            }
+        },
+    };
+
+    if let Err(e) = validate_https_or_loopback_url(&entry.status_list_credential) {
+        return handle_unknown_vc_status(
+            state,
+            call,
+            runtime,
+            &provider_id,
+            "vc_status_insecure_url",
+            &e.to_string(),
+        )
+        .await;
+    }
+
+    let status_cred =
+        match fetch_status_list_credential_cached(state, &entry.status_list_credential).await {
+            Ok(c) => c,
+            Err(e) => {
+                return handle_unknown_vc_status(
+                    state,
+                    call,
+                    runtime,
+                    &provider_id,
+                    "vc_status_fetch_failed",
+                    &e.to_string(),
+                )
+                .await;
+            }
+        };
+
+    if status_cred.status_purpose != entry.status_purpose {
+        return handle_unknown_vc_status(
+            state,
+            call,
+            runtime,
+            &provider_id,
+            "vc_status_purpose_mismatch",
+            "credentialStatus.statusPurpose does not match status list",
+        )
+        .await;
+    }
+
+    let bitstring =
+        match briefcase_revocation::decode_encoded_list_multibase_gzip(&status_cred.encoded_list) {
+            Ok(b) => b,
+            Err(e) => {
+                return handle_unknown_vc_status(
+                    state,
+                    call,
+                    runtime,
+                    &provider_id,
+                    "vc_status_decode_failed",
+                    &e.to_string(),
+                )
+                .await;
+            }
+        };
+
+    let status_value = match briefcase_revocation::read_status_value_msb0(
+        &bitstring,
+        entry.status_list_index,
+        status_cred.status_size,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            return handle_unknown_vc_status(
+                state,
+                call,
+                runtime,
+                &provider_id,
+                "vc_status_index_out_of_range",
+                &e.to_string(),
+            )
+            .await;
+        }
+    };
+
+    let is_revoked = if entry.status_purpose == "revocation" {
+        status_value == 1
+    } else {
+        status_value != 0
+    };
+
+    let decision = if is_revoked { "revoked" } else { "valid" };
+    let _receipt = state
+        .receipts
+        .append(serde_json::json!({
+            "kind": "vc_status_check",
+            "provider_id": provider_id.as_str(),
+            "status_list_credential": entry.status_list_credential.as_str(),
+            "status_purpose": entry.status_purpose.as_str(),
+            "status_list_index": entry.status_list_index,
+            "status_size": status_cred.status_size,
+            "status_value": status_value,
+            "decision": decision,
+            "ts": Utc::now().to_rfc3339(),
+        }))
+        .await?;
+
+    if is_revoked {
+        state.db.mark_vc_revoked(&provider_id, Utc::now()).await?;
+        state.provider.forget_cached_token(&provider_id).await;
+    }
+
+    Ok(None)
+}
+
+async fn handle_unknown_vc_status(
+    state: &AppState,
+    call: &ToolCall,
+    runtime: &str,
+    provider_id: &str,
+    code: &str,
+    detail: &str,
+) -> anyhow::Result<Option<CallToolResponse>> {
+    let mut detail = detail.replace('\n', " ");
+    if detail.len() > 200 {
+        detail.truncate(200);
+    }
+
+    let _receipt = state
+        .receipts
+        .append(serde_json::json!({
+            "kind": "vc_status_check",
+            "provider_id": provider_id,
+            "decision": "unknown",
+            "code": code,
+            "detail": detail,
+            "ts": Utc::now().to_rfc3339(),
+        }))
+        .await?;
+
+    match state.vc_status_unknown_mode {
+        VcStatusUnknownMode::Deny => {
+            state
+                .receipts
+                .append(serde_json::json!({
+                    "kind": "tool_call",
+                    "tool_id": call.tool_id,
+                    "runtime": runtime,
+                    "decision": "deny",
+                    "reason": "vc_status_unknown",
+                    "ts": Utc::now().to_rfc3339(),
+                }))
+                .await?;
+            Ok(Some(CallToolResponse::Denied {
+                reason: "vc_status_unknown".to_string(),
+            }))
+        }
+        VcStatusUnknownMode::RequireApproval => {
+            if call.approval_token.is_some() {
+                return Ok(None);
+            }
+
+            let approval = state
+                .db
+                .create_approval(
+                    &call.tool_id,
+                    "vc_status_unknown",
+                    ApprovalKind::Local,
+                    &call.args,
+                )
+                .await?;
+
+            state
+                .receipts
+                .append(serde_json::json!({
+                    "kind": "tool_call",
+                    "tool_id": call.tool_id,
+                    "runtime": runtime,
+                    "decision": "approval_required",
+                    "approval_id": approval.id,
+                    "approval_kind": approval.kind,
+                    "reason": "vc_status_unknown",
+                    "ts": Utc::now().to_rfc3339(),
+                }))
+                .await?;
+
+            Ok(Some(CallToolResponse::ApprovalRequired { approval }))
+        }
+    }
+}
+
+async fn fetch_status_list_credential_cached(
+    state: &AppState,
+    url: &url::Url,
+) -> anyhow::Result<briefcase_revocation::BitstringStatusListCredential> {
+    let url_s = url.as_str();
+    if let Some(cache) = state.db.get_vc_status_list_cache(url_s).await? {
+        if Utc::now() < cache.expires_at {
+            let ttl_ms = cache.ttl_ms.and_then(|v| u64::try_from(v).ok());
+            return Ok(briefcase_revocation::BitstringStatusListCredential {
+                encoded_list: cache.encoded_list,
+                status_purpose: cache.status_purpose,
+                status_size: usize::try_from(cache.status_size).unwrap_or(1).max(1),
+                ttl_ms,
+            });
+        }
+
+        // Cache is stale; try a conditional GET when possible.
+        let mut req = state.http.get(url.clone());
+        if let Some(etag) = &cache.etag {
+            req = req.header(reqwest::header::IF_NONE_MATCH, etag);
+        }
+
+        let resp = req.send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+            let ttl_ms = cache
+                .ttl_ms
+                .and_then(|v| u64::try_from(v).ok())
+                .unwrap_or(DEFAULT_VC_STATUS_LIST_TTL_MS)
+                .min(24 * 60 * 60 * 1000);
+            let fetched_at = Utc::now();
+            let expires_at = fetched_at + chrono::Duration::milliseconds(ttl_ms as i64);
+            state
+                .db
+                .upsert_vc_status_list_cache(crate::db::VcStatusListCacheRecord {
+                    url: cache.url.clone(),
+                    encoded_list: cache.encoded_list.clone(),
+                    status_purpose: cache.status_purpose.clone(),
+                    status_size: cache.status_size,
+                    ttl_ms: cache.ttl_ms,
+                    etag: cache.etag.clone(),
+                    fetched_at,
+                    expires_at,
+                })
+                .await?;
+
+            return Ok(briefcase_revocation::BitstringStatusListCredential {
+                encoded_list: cache.encoded_list,
+                status_purpose: cache.status_purpose,
+                status_size: usize::try_from(cache.status_size).unwrap_or(1).max(1),
+                ttl_ms: cache.ttl_ms.and_then(|v| u64::try_from(v).ok()),
+            });
+        }
+    }
+
+    let resp = state.http.get(url.clone()).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("status list fetch failed: {}", resp.status());
+    }
+
+    let etag = resp
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let header_ttl_ms =
+        ttl_ms_from_headers(resp.headers()).unwrap_or(DEFAULT_VC_STATUS_LIST_TTL_MS);
+
+    let bytes = resp.bytes().await?;
+    if bytes.len() > MAX_VC_STATUS_LIST_DOC_BYTES {
+        anyhow::bail!("status list doc too large");
+    }
+    let doc: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let cred = briefcase_revocation::BitstringStatusListCredential::parse_from_json(&doc)?;
+
+    let ttl_ms = cred
+        .ttl_ms
+        .unwrap_or(header_ttl_ms)
+        .min(24 * 60 * 60 * 1000);
+    let fetched_at = Utc::now();
+    let expires_at = fetched_at + chrono::Duration::milliseconds(ttl_ms as i64);
+
+    state
+        .db
+        .upsert_vc_status_list_cache(crate::db::VcStatusListCacheRecord {
+            url: url_s.to_string(),
+            encoded_list: cred.encoded_list.clone(),
+            status_purpose: cred.status_purpose.clone(),
+            status_size: cred.status_size as i64,
+            ttl_ms: Some(i64::try_from(ttl_ms).unwrap_or(i64::MAX)),
+            etag,
+            fetched_at,
+            expires_at,
+        })
+        .await?;
+
+    Ok(cred)
+}
+
+fn ttl_ms_from_headers(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let cc = headers.get(reqwest::header::CACHE_CONTROL)?.to_str().ok()?;
+    for part in cc.split(',') {
+        let p = part.trim();
+        let v = p
+            .strip_prefix("max-age=")
+            .or_else(|| p.strip_prefix("s-maxage="));
+        if let Some(v) = v
+            && let Ok(secs) = v.parse::<u64>()
+        {
+            return Some(secs.saturating_mul(1000));
+        }
+    }
+    None
+}
+
+fn validate_https_or_loopback_url(u: &url::Url) -> anyhow::Result<()> {
+    match u.scheme() {
+        "https" => {}
+        "http" => {
+            let host = u.host().context("status list url missing host")?;
+            let is_loopback = match host {
+                url::Host::Domain(d) => d.eq_ignore_ascii_case("localhost"),
+                url::Host::Ipv4(ip) => ip.is_loopback(),
+                url::Host::Ipv6(ip) => ip.is_loopback(),
+            };
+            if !is_loopback {
+                anyhow::bail!("status list url must be https (or http to localhost)");
+            }
+        }
+        _ => anyhow::bail!("unsupported scheme"),
+    }
+
+    if !u.username().is_empty() || u.password().is_some() {
+        anyhow::bail!("userinfo not allowed");
+    }
+    if u.fragment().is_some() {
+        anyhow::bail!("fragment not allowed");
+    }
+    Ok(())
+}
+
 async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<CallToolResponse> {
     enum ResolvedTool {
         Local(Arc<crate::tools::ToolRuntime>),
@@ -1290,6 +1739,10 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
             .await?;
 
         return Ok(CallToolResponse::ApprovalRequired { approval });
+    }
+
+    if let Some(resp) = preflight_vc_status_check(state, &call, runtime.as_str()).await? {
+        return Ok(resp);
     }
 
     let exec = match &tool {
@@ -1569,9 +2022,28 @@ async fn fetch_vc(
         .map_err(internal_error)?
         .with_timezone(&Utc);
 
+    let (status_list_url, status_list_index, status_purpose) =
+        match briefcase_revocation::BitstringStatusListEntry::parse_from_vc_jwt(&issued.vc_jwt) {
+            Ok(Some(e)) => (
+                Some(e.status_list_credential.to_string()),
+                i64::try_from(e.status_list_index).ok(),
+                Some(e.status_purpose),
+            ),
+            _ => (None, None, None),
+        };
+
     state
         .db
-        .upsert_vc(&provider_id, &issued.vc_jwt, expires_at)
+        .upsert_vc(
+            &provider_id,
+            crate::db::VcUpsert {
+                vc_jwt: issued.vc_jwt.clone(),
+                expires_at,
+                status_list_url,
+                status_list_index,
+                status_purpose,
+            },
+        )
         .await
         .map_err(internal_error)?;
 
@@ -2092,6 +2564,9 @@ mod tests {
         paid: Arc<tokio::sync::Mutex<bool>>,
         pay_calls: Arc<tokio::sync::Mutex<u64>>,
         oauth_revoke_calls: Arc<tokio::sync::Mutex<u64>>,
+        status_list_calls: Arc<tokio::sync::Mutex<u64>>,
+        vc_revoked: Arc<tokio::sync::Mutex<bool>>,
+        force_status_list_error: Arc<tokio::sync::Mutex<bool>>,
     }
 
     async fn start_mock_remote_mcp()
@@ -2941,10 +3416,11 @@ mod tests {
 
     async fn start_mock_provider()
     -> anyhow::Result<(SocketAddr, MockProviderState, tokio::task::JoinHandle<()>)> {
-        use axum::extract::{Form, State as AxumState};
+        use axum::extract::{Form, Path as AxumPath, State as AxumState};
         use axum::http::HeaderMap;
         use axum::routing::{get, post};
         use axum::{Json, Router};
+        use base64::Engine as _;
         use reqwest::StatusCode;
 
         async fn token(
@@ -3044,7 +3520,8 @@ mod tests {
                     })),
                 ),
                 "refresh_token" => {
-                    if body.refresh_token.as_deref() != Some("rt_mock") {
+                    if !matches!(body.refresh_token.as_deref(), Some("rt_mock") | Some("rt_mock2"))
+                    {
                         return (
                             StatusCode::BAD_REQUEST,
                             Json(serde_json::json!({"error":"invalid_grant"})),
@@ -3106,11 +3583,96 @@ mod tests {
                     Json(serde_json::json!({"error":"unauthorized"})),
                 );
             }
+
+            // Issue a best-effort JWT VC containing a Bitstring Status List entry.
+            // The daemon uses this metadata for revocation checks, but does not rely on the VC
+            // contents for authorization (the provider remains authoritative).
+            let host = headers
+                .get("host")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("localhost");
+            let status_list_credential = format!("http://{host}/vc/status/1");
+
+            let now = Utc::now();
+            let exp = now + chrono::Duration::days(30);
+            let header = serde_json::json!({ "alg": "HS256", "typ": "JWT" });
+            let payload = serde_json::json!({
+                "iss": "mock-provider",
+                "sub": "did:example:holder",
+                "iat": now.timestamp(),
+                "exp": exp.timestamp(),
+                "credentialStatus": {
+                    "type": "BitstringStatusListEntry",
+                    "statusPurpose": "revocation",
+                    "statusListIndex": "1",
+                    "statusListCredential": status_list_credential,
+                }
+            });
+
+            let header_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&header).expect("encode header"));
+            let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&payload).expect("encode payload"));
+            let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"sig");
+            let vc_jwt = format!("{header_b64}.{payload_b64}.{sig_b64}");
+
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
-                    "vc_jwt": "vc_mock",
-                    "expires_at_rfc3339": (Utc::now() + chrono::Duration::days(30)).to_rfc3339(),
+                    "vc_jwt": vc_jwt,
+                    "expires_at_rfc3339": exp.to_rfc3339(),
+                })),
+            )
+        }
+
+        async fn vc_status(
+            AxumState(st): AxumState<MockProviderState>,
+            AxumPath(id): AxumPath<String>,
+        ) -> (StatusCode, Json<serde_json::Value>) {
+            use flate2::Compression;
+            use flate2::write::GzEncoder;
+            use std::io::Write as _;
+
+            *st.status_list_calls.lock().await += 1;
+
+            if id != "1" {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error":"not_found"})),
+                );
+            }
+
+            if *st.force_status_list_error.lock().await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error":"forced_error"})),
+                );
+            }
+
+            // Status list v1.0 requires at least 16KB uncompressed (131,072 bits for statusSize=1).
+            let mut raw = vec![0u8; 16 * 1024];
+            if *st.vc_revoked.lock().await {
+                // Index 1 -> second bit (MSB0): set bit 6 of the first byte.
+                raw[0] |= 1 << 6;
+            }
+
+            let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(&raw).expect("gzip encode");
+            let gz = enc.finish().expect("gzip finish");
+            let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(gz);
+            let encoded_list = format!("u{b64}");
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "type": ["VerifiableCredential", "BitstringStatusListCredential"],
+                    "credentialSubject": {
+                        "type": "BitstringStatusList",
+                        "statusPurpose": "revocation",
+                        "statusSize": 1,
+                        "ttl": 300000,
+                        "encodedList": encoded_list,
+                    }
                 })),
             )
         }
@@ -3146,6 +3708,9 @@ mod tests {
             paid: Arc::new(tokio::sync::Mutex::new(false)),
             pay_calls: Arc::new(tokio::sync::Mutex::new(0)),
             oauth_revoke_calls: Arc::new(tokio::sync::Mutex::new(0)),
+            status_list_calls: Arc::new(tokio::sync::Mutex::new(0)),
+            vc_revoked: Arc::new(tokio::sync::Mutex::new(false)),
+            force_status_list_error: Arc::new(tokio::sync::Mutex::new(false)),
         };
 
         let app = Router::new()
@@ -3154,6 +3719,7 @@ mod tests {
             .route("/oauth/token", post(oauth_token))
             .route("/oauth/revoke", post(oauth_revoke))
             .route("/vc/issue", post(vc_issue))
+            .route("/vc/status/{id}", get(vc_status))
             .route("/api/quote", get(quote))
             .with_state(st.clone());
 
@@ -3313,6 +3879,7 @@ mod tests {
             provider_base_url,
             AppOptions {
                 require_signer_for_approvals: true,
+                ..Default::default()
             },
         )
         .await?;
@@ -3395,6 +3962,7 @@ mod tests {
             provider_base_url,
             AppOptions {
                 require_signer_for_approvals: true,
+                ..Default::default()
             },
         )
         .await?;
@@ -3810,6 +4378,248 @@ mod tests {
 
         let pay_calls = *provider_state.pay_calls.lock().await;
         assert_eq!(pay_calls, 0, "expected quote path to avoid payment");
+
+        daemon_task.abort();
+        provider_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn vc_status_list_is_cached_and_revoked_vc_falls_back_to_oauth() -> anyhow::Result<()> {
+        let (provider_addr, provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let (state, _daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
+
+        client
+            .oauth_exchange(
+                "demo",
+                OAuthExchangeRequest {
+                    code: "code_mock".to_string(),
+                    redirect_uri: "http://127.0.0.1/callback".to_string(),
+                    client_id: "briefcase-cli".to_string(),
+                    code_verifier: "verifier".to_string(),
+                },
+            )
+            .await?;
+        client.fetch_vc("demo").await?;
+
+        // First quote: status list is fetched, VC auth path is used.
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "quote".to_string(),
+                    args: serde_json::json!({ "symbol": "TEST" }),
+                    context: ToolCallContext::new(),
+                    approval_token: None,
+                },
+            })
+            .await?;
+        assert!(
+            matches!(resp, CallToolResponse::Ok { .. }),
+            "unexpected quote response after VC revoke: {resp:?}"
+        );
+        assert_eq!(*provider_state.pay_calls.lock().await, 0);
+        assert_eq!(*provider_state.status_list_calls.lock().await, 1);
+
+        let receipts = client.list_receipts().await?.receipts;
+        let latest_quote = receipts
+            .iter()
+            .find(|r| {
+                r.event.get("kind").and_then(|v| v.as_str()) == Some("tool_call")
+                    && r.event.get("tool_id").and_then(|v| v.as_str()) == Some("quote")
+                    && r.event.get("decision").and_then(|v| v.as_str()) == Some("allow")
+            })
+            .context("missing quote tool_call receipt")?;
+        assert_eq!(
+            latest_quote
+                .event
+                .get("auth_method")
+                .and_then(|v| v.as_str()),
+            Some("vc")
+        );
+
+        // Second quote: status list should be served from cache (no extra status list HTTP calls).
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "quote".to_string(),
+                    args: serde_json::json!({ "symbol": "TEST" }),
+                    context: ToolCallContext::new(),
+                    approval_token: None,
+                },
+            })
+            .await?;
+        assert!(matches!(resp, CallToolResponse::Ok { .. }));
+        assert_eq!(*provider_state.status_list_calls.lock().await, 1);
+
+        // Revoke the VC (provider flips status list bit) and force cache expiry so the daemon re-fetches.
+        *provider_state.vc_revoked.lock().await = true;
+        let vc = state
+            .db
+            .vc_record("demo")
+            .await?
+            .context("missing vc record")?;
+        let status_url = vc
+            .status_list_url
+            .as_ref()
+            .context("missing status_list_url")?
+            .to_string();
+        let mut cache = state
+            .db
+            .get_vc_status_list_cache(&status_url)
+            .await?
+            .context("missing status list cache")?;
+        cache.expires_at = Utc::now() - chrono::Duration::seconds(1);
+        state.db.upsert_vc_status_list_cache(cache).await?;
+
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "quote".to_string(),
+                    args: serde_json::json!({ "symbol": "TEST" }),
+                    context: ToolCallContext::new(),
+                    approval_token: None,
+                },
+            })
+            .await?;
+        assert!(
+            matches!(resp, CallToolResponse::Ok { .. }),
+            "unexpected quote response after VC revoke: {resp:?}"
+        );
+        assert_eq!(*provider_state.pay_calls.lock().await, 0);
+        assert!(
+            state.db.get_vc("demo").await?.is_none(),
+            "VC should be marked revoked and hidden from get_vc"
+        );
+
+        let receipts = client.list_receipts().await?.receipts;
+        let latest_quote = receipts
+            .iter()
+            .find(|r| {
+                r.event.get("kind").and_then(|v| v.as_str()) == Some("tool_call")
+                    && r.event.get("tool_id").and_then(|v| v.as_str()) == Some("quote")
+                    && r.event.get("decision").and_then(|v| v.as_str()) == Some("allow")
+            })
+            .context("missing quote tool_call receipt (after revoke)")?;
+        assert_eq!(
+            latest_quote
+                .event
+                .get("auth_method")
+                .and_then(|v| v.as_str()),
+            Some("oauth"),
+            "expected OAuth fallback after VC revocation"
+        );
+
+        daemon_task.abort();
+        provider_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn vc_status_unknown_requires_approval_by_default() -> anyhow::Result<()> {
+        let (provider_addr, provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let (_state, _daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
+
+        client
+            .oauth_exchange(
+                "demo",
+                OAuthExchangeRequest {
+                    code: "code_mock".to_string(),
+                    redirect_uri: "http://127.0.0.1/callback".to_string(),
+                    client_id: "briefcase-cli".to_string(),
+                    code_verifier: "verifier".to_string(),
+                },
+            )
+            .await?;
+        client.fetch_vc("demo").await?;
+
+        *provider_state.force_status_list_error.lock().await = true;
+
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "quote".to_string(),
+                    args: serde_json::json!({ "symbol": "TEST" }),
+                    context: ToolCallContext::new(),
+                    approval_token: None,
+                },
+            })
+            .await?;
+
+        let approval_id = match resp {
+            CallToolResponse::ApprovalRequired { approval } => approval.id,
+            _ => anyhow::bail!("expected approval_required for vc_status_unknown"),
+        };
+
+        let approved = client.approve(&approval_id).await?;
+
+        // Retry should proceed even though status list is still unavailable.
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "quote".to_string(),
+                    args: serde_json::json!({ "symbol": "TEST" }),
+                    context: ToolCallContext::new(),
+                    approval_token: Some(approved.approval_token),
+                },
+            })
+            .await?;
+        assert!(matches!(resp, CallToolResponse::Ok { .. }));
+        assert_eq!(*provider_state.pay_calls.lock().await, 0);
+
+        daemon_task.abort();
+        provider_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn vc_status_unknown_deny_mode_denies() -> anyhow::Result<()> {
+        let (provider_addr, provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let (_state, _daemon_base, client, daemon_task) = start_daemon_with_options(
+            provider_base_url,
+            AppOptions {
+                vc_status_unknown_mode: VcStatusUnknownMode::Deny,
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        client
+            .oauth_exchange(
+                "demo",
+                OAuthExchangeRequest {
+                    code: "code_mock".to_string(),
+                    redirect_uri: "http://127.0.0.1/callback".to_string(),
+                    client_id: "briefcase-cli".to_string(),
+                    code_verifier: "verifier".to_string(),
+                },
+            )
+            .await?;
+        client.fetch_vc("demo").await?;
+
+        *provider_state.force_status_list_error.lock().await = true;
+
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "quote".to_string(),
+                    args: serde_json::json!({ "symbol": "TEST" }),
+                    context: ToolCallContext::new(),
+                    approval_token: None,
+                },
+            })
+            .await?;
+        match resp {
+            CallToolResponse::Denied { reason } => {
+                assert_eq!(reason, "vc_status_unknown");
+            }
+            _ => anyhow::bail!("expected denied"),
+        }
 
         daemon_task.abort();
         provider_task.abort();
