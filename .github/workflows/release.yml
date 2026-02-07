@@ -298,9 +298,55 @@ jobs:
       - control_plane_container
       - sbom
     steps:
-      - name: Download artifacts
+      # Download only the artifacts we intentionally publish.
+      # GitHub can attach extra artifacts (e.g. build provenance) that are not
+      # required for the release and can be flaky to download/extract.
+      - name: Download artifacts (rust linux)
         uses: actions/download-artifact@v4
         with:
+          name: ubuntu-latest-artifacts
+          path: dist
+
+      - name: Download artifacts (rust macos)
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-latest-artifacts
+          path: dist
+
+      - name: Download artifacts (rust windows)
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-latest-artifacts
+          path: dist
+
+      - name: Download artifacts (browser extension)
+        uses: actions/download-artifact@v4
+        with:
+          name: extension-artifacts
+          path: dist
+
+      - name: Download artifacts (mobile android)
+        uses: actions/download-artifact@v4
+        with:
+          name: mobile-android-artifacts
+          path: dist
+
+      - name: Download artifacts (mobile ios)
+        uses: actions/download-artifact@v4
+        with:
+          name: mobile-ios-artifacts
+          path: dist
+
+      - name: Download artifacts (control plane image digest)
+        uses: actions/download-artifact@v4
+        with:
+          name: control-plane-image
+          path: dist
+
+      - name: Download artifacts (sbom)
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom
           path: dist
 
       - name: Install cosign
