@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use briefcase_core::AuthMethod;
-use briefcase_payments::{PaymentBackend, PaymentChallenge, PaymentProof, parse_www_authenticate};
+use briefcase_payments::{
+    PaymentBackend, PaymentChallenge, PaymentProof, parse_www_authenticate, x402,
+};
 use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -336,6 +338,54 @@ impl ProviderClient {
             anyhow::bail!("unexpected token status: {}", resp.status());
         }
 
+        // Prefer x402 v2 header-based flow when present, but allow legacy/demo fallback.
+        // This keeps existing demo providers working without requiring an external wallet helper.
+        if let Some(b64) = resp
+            .headers()
+            .get(x402::HEADER_PAYMENT_REQUIRED)
+            .and_then(|h| h.to_str().ok())
+        {
+            match x402::decode_payment_required_b64(b64) {
+                Ok(required) => match self.payments.pay_x402_v2(&provider_base, required).await {
+                    Ok(PaymentProof::X402V2 {
+                        payment_signature_b64,
+                    }) => {
+                        let mut req = self.http.post(token_url.clone());
+                        if let Some(pop) = &self.pop {
+                            // For the retry, generate a fresh DPoP proof (new jti) bound to the same key.
+                            let dpop = briefcase_dpop::dpop_proof_for_token_endpoint(
+                                pop.as_ref(),
+                                &token_url,
+                            )
+                            .await?;
+                            req = req.header("DPoP", dpop);
+                        }
+                        req = req.header(x402::HEADER_PAYMENT_SIGNATURE, payment_signature_b64);
+
+                        let resp = req.send().await?;
+                        if !resp.status().is_success() {
+                            anyhow::bail!(
+                                "token request after x402 v2 payment failed: {}",
+                                resp.status()
+                            );
+                        }
+                        let tr = resp.json::<TokenResponse>().await?;
+                        return parse_token_response(base_url, tr, AuthMethod::PaymentX402);
+                    }
+                    Ok(_) => {
+                        // Do not log the proof itself (signatures/preimages are sensitive).
+                        warn!("unexpected payment proof type for x402 v2; falling back to legacy");
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "x402 v2 payment failed; falling back to legacy rails");
+                    }
+                },
+                Err(err) => {
+                    warn!(error = %err, "invalid PAYMENT-REQUIRED header; falling back to legacy rails");
+                }
+            }
+        }
+
         let challenge = if let Some(www) = resp
             .headers()
             .get(reqwest::header::WWW_AUTHENTICATE)
@@ -375,6 +425,12 @@ impl ProviderClient {
                     .header("x-payment-proof", proof);
                 AuthMethod::PaymentX402
             }
+            PaymentProof::X402V2 {
+                payment_signature_b64,
+            } => {
+                req = req.header(x402::HEADER_PAYMENT_SIGNATURE, payment_signature_b64);
+                AuthMethod::PaymentX402
+            }
             PaymentProof::L402 { macaroon, preimage } => {
                 req = req
                     .header(
@@ -409,4 +465,202 @@ fn parse_token_response(
         remaining_calls: tr.max_calls,
         minted_via,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+
+    use axum::extract::State as AxumState;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode as AxumStatusCode, Uri};
+    use axum::response::IntoResponse as _;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use chrono::Utc;
+    use tempfile::tempdir;
+
+    #[derive(Clone)]
+    struct X402V2State {
+        verified: Arc<tokio::sync::Mutex<bool>>,
+    }
+
+    fn expected_request_url(headers: &HeaderMap, uri: &Uri) -> Result<Url, AxumStatusCode> {
+        let host = headers
+            .get("host")
+            .and_then(|h| h.to_str().ok())
+            .ok_or(AxumStatusCode::BAD_REQUEST)?;
+        let scheme = headers
+            .get("x-forwarded-proto")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("http");
+
+        let pq = uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or_else(|| uri.path());
+        Url::parse(&format!("{scheme}://{host}{pq}")).map_err(|_| AxumStatusCode::BAD_REQUEST)
+    }
+
+    fn build_required(resource_url: &Url, amount_microusd: i64) -> x402::PaymentRequired {
+        x402::PaymentRequired {
+            x402_version: 2,
+            error: Some("PAYMENT-SIGNATURE header is required".to_string()),
+            resource: x402::ResourceInfo {
+                url: resource_url.to_string(),
+                description: Some("test paid token".to_string()),
+                mime_type: Some("application/json".to_string()),
+            },
+            accepts: vec![x402::PaymentRequirements {
+                scheme: "exact".to_string(),
+                network: "eip155:84532".to_string(),
+                amount: amount_microusd.to_string(),
+                asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e".to_string(),
+                pay_to: "0x209693Bc6afc0C5328bA36FaF03C514EF312287C".to_string(),
+                max_timeout_seconds: 60,
+                extra: serde_json::json!({
+                    "assetTransferMethod": "eip3009",
+                    "name": "USD Coin",
+                    "version": "2",
+                }),
+            }],
+            extensions: serde_json::json!({}),
+        }
+    }
+
+    async fn token_v2(
+        AxumState(st): AxumState<X402V2State>,
+        uri: Uri,
+        headers: HeaderMap,
+    ) -> axum::response::Response {
+        let resource_url = match expected_request_url(&headers, &uri) {
+            Ok(u) => u,
+            Err(sc) => {
+                return (sc, Json(serde_json::json!({"error":"invalid_request_url"})))
+                    .into_response();
+            }
+        };
+
+        let required = build_required(&resource_url, 2000);
+
+        if let Some(sig) = headers
+            .get(x402::HEADER_PAYMENT_SIGNATURE)
+            .and_then(|h| h.to_str().ok())
+        {
+            let payload = match x402::decode_payment_payload_b64(sig) {
+                Ok(p) => p,
+                Err(_) => {
+                    return (
+                        AxumStatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error":"invalid_payment_signature"})),
+                    )
+                        .into_response();
+                }
+            };
+
+            let offered = required.accepts.first().unwrap().clone();
+            if payload.accepted != offered {
+                return (
+                    AxumStatusCode::PAYMENT_REQUIRED,
+                    Json(serde_json::json!({"error":"terms_mismatch"})),
+                )
+                    .into_response();
+            }
+
+            let payer = match x402::evm::verify_eip3009_payload(&required, &payload) {
+                Ok(p) => p,
+                Err(_) => {
+                    return (
+                        AxumStatusCode::PAYMENT_REQUIRED,
+                        Json(serde_json::json!({"error":"invalid_payment"})),
+                    )
+                        .into_response();
+                }
+            };
+
+            *st.verified.lock().await = true;
+
+            let tr = serde_json::json!({
+                "token": "cap_v2",
+                "expires_at_rfc3339": (Utc::now() + chrono::Duration::minutes(10)).to_rfc3339(),
+                "max_calls": 50
+            });
+            let mut resp = (AxumStatusCode::OK, Json(tr)).into_response();
+
+            let settlement = x402::SettlementResponse {
+                success: true,
+                error_reason: None,
+                payer: Some(payer),
+                transaction: "0xdeadbeef".to_string(),
+                network: payload.accepted.network,
+            };
+            if let Ok(b64) = x402::encode_settlement_response_b64(&settlement)
+                && let Ok(hv) = HeaderValue::from_str(&b64)
+            {
+                resp.headers_mut().insert(x402::HEADER_PAYMENT_RESPONSE, hv);
+            }
+            return resp;
+        }
+
+        let mut resp = (
+            AxumStatusCode::PAYMENT_REQUIRED,
+            Json(serde_json::json!({"error":"payment_required"})),
+        )
+            .into_response();
+        if let Ok(b64) = x402::encode_payment_required_b64(&required)
+            && let Ok(hv) = HeaderValue::from_str(&b64)
+        {
+            resp.headers_mut().insert(x402::HEADER_PAYMENT_REQUIRED, hv);
+        }
+        resp
+    }
+
+    #[tokio::test]
+    async fn x402_v2_token_mint_via_helper() -> anyhow::Result<()> {
+        let helper = match std::env::var("BRIEFCASE_TEST_PAYMENT_HELPER") {
+            Ok(v) => v,
+            Err(_) => return Ok(()), // allow skipping in default CI; dedicated harness runs this
+        };
+        if std::env::var("BRIEFCASE_X402_EVM_PRIVATE_KEY_HEX").is_err()
+            && std::env::var("BRIEFCASE_X402_EVM_PRIVATE_KEY_FILE").is_err()
+        {
+            return Ok(());
+        }
+
+        let st = X402V2State {
+            verified: Arc::new(tokio::sync::Mutex::new(false)),
+        };
+        let app = Router::new()
+            .route("/token", post(token_v2))
+            .with_state(st.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let base_url = format!("http://{addr}");
+
+        let dir = tempdir()?;
+        let db_path = dir.path().join("briefcase.sqlite");
+        let db = Db::open(&db_path).await?;
+        db.init().await?;
+        let secrets = Arc::new(briefcase_secrets::InMemorySecretStore::default());
+
+        let payments = Arc::new(
+            briefcase_payments::CommandPaymentBackend::new(helper)
+                .with_timeout(std::time::Duration::from_secs(30)),
+        );
+        let client = ProviderClient::new(secrets, db, None, payments);
+
+        let tok = client.fetch_token_via_payment(&base_url).await?;
+        assert_eq!(tok.token, "cap_v2");
+        assert!(matches!(tok.minted_via, AuthMethod::PaymentX402));
+        assert!(*st.verified.lock().await);
+
+        handle.abort();
+        Ok(())
+    }
 }

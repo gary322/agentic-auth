@@ -1,5 +1,5 @@
 [package]
-name = "briefcase-payments"
+name = "briefcase-payment-helper"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,14 +7,8 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-async-trait.workspace = true
-base64.workspace = true
+briefcase-payments = { path = "../../crates/briefcase-payments" }
+clap.workspace = true
 hex.workspace = true
-rand.workspace = true
-reqwest.workspace = true
 secp256k1.workspace = true
-serde.workspace = true
 serde_json.workspace = true
-sha3.workspace = true
-tokio.workspace = true
-url.workspace = true

@@ -209,14 +209,14 @@ For each task, include:
 
 ## Phase 7: Real x402 Stablecoin Payments
 
-- [ ] 7.1 Implement x402 payment backend
+- [x] 7.1 Implement x402 payment backend
   - **Do**: implement x402 spec-compliant challenge parsing and payment execution; support a real wallet backend (helper process encouraged).
   - **Files**: `crates/briefcase-payments/src/x402.rs` (new), `apps/briefcase-payment-helper/*` (new)
   - **Done when**: can complete x402 payment against a real provider sandbox/testnet.
   - **Verify**: integration tests + staged manual test.
   - _Reqs: FR-8_
 
-- [ ] 7.2 Build x402 test harness
+- [x] 7.2 Build x402 test harness
   - **Do**: docker-compose or local harness providing a fake x402 provider and wallet backend; run in CI.
   - **Files**: `docker/x402-harness/*`, `.github/workflows/*`
   - **Done when**: CI runs x402 integration test deterministically.

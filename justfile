@@ -47,3 +47,8 @@ test-pkcs11:
 test-tpm2:
   docker build -f docker/swtpm/Dockerfile -t credential-briefcase-swtpm .
   docker run --rm -v {{invocation_directory()}}:/workspace -w /workspace credential-briefcase-swtpm bash docker/swtpm/run-tests.sh
+
+# x402 v2 (stablecoin) integration harness.
+test-x402:
+  docker build -f docker/x402-harness/Dockerfile -t credential-briefcase-x402 .
+  docker run --rm -v {{invocation_directory()}}:/workspace -w /workspace credential-briefcase-x402 bash docker/x402-harness/run-tests.sh

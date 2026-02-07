@@ -130,6 +130,18 @@ jobs:
       - name: Run TPM2 tests (swtpm)
         run: docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace credential-briefcase-swtpm bash docker/swtpm/run-tests.sh
 
+  x402:
+    name: x402 (stablecoin v2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build x402 harness image
+        run: docker build -f docker/x402-harness/Dockerfile -t credential-briefcase-x402 .
+
+      - name: Run x402 v2 harness
+        run: docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace credential-briefcase-x402 bash docker/x402-harness/run-tests.sh
+
   ios_signer_build:
     name: iOS signer (build)
     runs-on: macos-latest

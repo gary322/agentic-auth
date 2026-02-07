@@ -13,6 +13,7 @@ chrono.workspace = true
 clap.workspace = true
 ed25519-dalek.workspace = true
 hmac.workspace = true
+hex.workspace = true
 jsonwebtoken.workspace = true
 rand.workspace = true
 serde.workspace = true
@@ -27,6 +28,7 @@ url.workspace = true
 uuid.workspace = true
 
 briefcase-dpop = { path = "../../crates/briefcase-dpop" }
+briefcase-payments = { path = "../../crates/briefcase-payments" }
 
 [dev-dependencies]
 p256.workspace = true

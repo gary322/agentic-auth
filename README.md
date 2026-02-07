@@ -31,6 +31,7 @@ This repo implements the core system described in `sop.txt`:
 - `apps/briefcase-cli`: admin CLI (tools, approvals, receipts)
 - `apps/briefcase-ui`: local web UI (approvals, receipts, provider status)
 - `apps/agent-access-gateway`: provider-side reference gateway (HTTP 402 + capability tokens)
+- `apps/briefcase-payment-helper`: external payment helper (keeps wallet keys out of the daemon)
 
 Shared crates:
 
@@ -92,6 +93,19 @@ cargo run -p briefcase-cli -- tools call note_add --args-json '{"text":"a note"}
 
 ```bash
 cargo run -p briefcase-cli -- tools call quote --args-json '{"symbol":"AAPL"}'
+```
+
+### x402 v2 (Spec-Compliant HTTP Headers)
+
+Some providers use x402 v2 transport headers (`PAYMENT-REQUIRED`, `PAYMENT-SIGNATURE`, `PAYMENT-RESPONSE`).
+`briefcased` supports this via the external helper, and will fall back to the legacy demo flow when possible.
+
+To enable the helper for x402 v2 signing:
+
+```bash
+export BRIEFCASE_PAYMENT_HELPER=./target/debug/briefcase-payment-helper
+export BRIEFCASE_X402_EVM_PRIVATE_KEY_HEX=...   # dev-only; do not use env vars for real custody
+cargo build -p briefcase-payment-helper
 ```
 
 7. Optional: do OAuth login and fetch a VC entitlement (then `quote` avoids payments):

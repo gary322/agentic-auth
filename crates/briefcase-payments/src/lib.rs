@@ -14,6 +14,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+pub mod helper_protocol;
+pub mod x402;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "rail", rename_all = "snake_case")]
 pub enum PaymentChallenge {
@@ -31,8 +34,17 @@ pub enum PaymentChallenge {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaymentProof {
-    X402 { proof: String },
-    L402 { macaroon: String, preimage: String },
+    X402 {
+        proof: String,
+    },
+    /// x402 v2: value for the HTTP `PAYMENT-SIGNATURE` header (base64-encoded JSON PaymentPayload).
+    X402V2 {
+        payment_signature_b64: String,
+    },
+    L402 {
+        macaroon: String,
+        preimage: String,
+    },
 }
 
 pub fn format_www_authenticate(challenge: &PaymentChallenge) -> String {
@@ -118,6 +130,18 @@ pub trait PaymentBackend: Send + Sync {
         provider_base_url: &Url,
         challenge: PaymentChallenge,
     ) -> anyhow::Result<PaymentProof>;
+
+    /// Form an x402 v2 payment payload for the HTTP transport, returning `PaymentProof::X402V2`.
+    ///
+    /// Default implementation errors so legacy/demo deployments don't accidentally attempt to
+    /// use x402 v2 without an explicit wallet backend.
+    async fn pay_x402_v2(
+        &self,
+        _provider_base_url: &Url,
+        _required: x402::PaymentRequired,
+    ) -> anyhow::Result<PaymentProof> {
+        anyhow::bail!("x402 v2 not supported by payment backend")
+    }
 }
 
 #[derive(Clone)]
@@ -240,6 +264,16 @@ impl PaymentBackend for HttpDemoPaymentBackend {
             }
         }
     }
+
+    async fn pay_x402_v2(
+        &self,
+        _provider_base_url: &Url,
+        _required: x402::PaymentRequired,
+    ) -> anyhow::Result<PaymentProof> {
+        anyhow::bail!(
+            "x402 v2 requires a wallet helper; set BRIEFCASE_PAYMENT_HELPER to a helper program"
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -269,57 +303,6 @@ impl CommandPaymentBackend {
     }
 }
 
-#[derive(Debug, Serialize)]
-#[serde(tag = "rail", rename_all = "snake_case")]
-enum PaymentHelperRequest {
-    X402 {
-        provider_base_url: String,
-        payment_id: String,
-        payment_url: String,
-        amount_microusd: i64,
-    },
-    L402 {
-        provider_base_url: String,
-        invoice: String,
-        macaroon: String,
-        amount_microusd: i64,
-    },
-}
-
-impl PaymentHelperRequest {
-    fn from_challenge(provider_base_url: &Url, ch: PaymentChallenge) -> Self {
-        match ch {
-            PaymentChallenge::X402 {
-                payment_id,
-                payment_url,
-                amount_microusd,
-            } => Self::X402 {
-                provider_base_url: provider_base_url.to_string(),
-                payment_id,
-                payment_url,
-                amount_microusd,
-            },
-            PaymentChallenge::L402 {
-                invoice,
-                macaroon,
-                amount_microusd,
-            } => Self::L402 {
-                provider_base_url: provider_base_url.to_string(),
-                invoice,
-                macaroon,
-                amount_microusd,
-            },
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "rail", rename_all = "snake_case")]
-enum PaymentHelperResponse {
-    X402 { proof: String },
-    L402 { preimage: String },
-}
-
 #[async_trait]
 impl PaymentBackend for CommandPaymentBackend {
     async fn pay(
@@ -327,7 +310,10 @@ impl PaymentBackend for CommandPaymentBackend {
         provider_base_url: &Url,
         challenge: PaymentChallenge,
     ) -> anyhow::Result<PaymentProof> {
-        let req = PaymentHelperRequest::from_challenge(provider_base_url, challenge.clone());
+        let req = helper_protocol::PaymentHelperRequest::from_legacy_challenge(
+            provider_base_url,
+            challenge.clone(),
+        );
         let input = serde_json::to_vec(&req).context("encode payment helper request")?;
 
         let mut cmd = tokio::process::Command::new(&self.program);
@@ -355,20 +341,84 @@ impl PaymentBackend for CommandPaymentBackend {
             anyhow::bail!("payment helper failed with status {}", out.status);
         }
 
-        let resp: PaymentHelperResponse =
+        let resp: helper_protocol::PaymentHelperResponse =
             serde_json::from_slice(&out.stdout).context("decode payment helper response")?;
 
         match (challenge, resp) {
-            (PaymentChallenge::X402 { .. }, PaymentHelperResponse::X402 { proof }) => {
-                Ok(PaymentProof::X402 { proof })
-            }
-            (PaymentChallenge::L402 { macaroon, .. }, PaymentHelperResponse::L402 { preimage }) => {
-                Ok(PaymentProof::L402 { macaroon, preimage })
-            }
-            (PaymentChallenge::X402 { .. }, PaymentHelperResponse::L402 { .. })
-            | (PaymentChallenge::L402 { .. }, PaymentHelperResponse::X402 { .. }) => {
+            (
+                PaymentChallenge::X402 { .. },
+                helper_protocol::PaymentHelperResponse::X402 { proof },
+            ) => Ok(PaymentProof::X402 { proof }),
+            (
+                PaymentChallenge::L402 { macaroon, .. },
+                helper_protocol::PaymentHelperResponse::L402 { preimage },
+            ) => Ok(PaymentProof::L402 { macaroon, preimage }),
+            (
+                PaymentChallenge::X402 { .. },
+                helper_protocol::PaymentHelperResponse::L402 { .. },
+            )
+            | (
+                PaymentChallenge::L402 { .. },
+                helper_protocol::PaymentHelperResponse::X402 { .. },
+            )
+            | (
+                PaymentChallenge::X402 { .. },
+                helper_protocol::PaymentHelperResponse::X402V2 { .. },
+            )
+            | (
+                PaymentChallenge::L402 { .. },
+                helper_protocol::PaymentHelperResponse::X402V2 { .. },
+            ) => {
                 anyhow::bail!("payment helper rail mismatch")
             }
+        }
+    }
+
+    async fn pay_x402_v2(
+        &self,
+        provider_base_url: &Url,
+        required: x402::PaymentRequired,
+    ) -> anyhow::Result<PaymentProof> {
+        let req = helper_protocol::PaymentHelperRequest::X402V2 {
+            provider_base_url: provider_base_url.to_string(),
+            payment_required: required,
+        };
+        let input = serde_json::to_vec(&req).context("encode payment helper request")?;
+
+        let mut cmd = tokio::process::Command::new(&self.program);
+        cmd.args(&self.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().context("spawn payment helper")?;
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt as _;
+            stdin
+                .write_all(&input)
+                .await
+                .context("write payment helper stdin")?;
+        }
+
+        let out = tokio::time::timeout(self.timeout, child.wait_with_output())
+            .await
+            .context("payment helper timeout")?
+            .context("wait payment helper")?;
+
+        if !out.status.success() {
+            anyhow::bail!("payment helper failed with status {}", out.status);
+        }
+
+        let resp: helper_protocol::PaymentHelperResponse =
+            serde_json::from_slice(&out.stdout).context("decode payment helper response")?;
+
+        match resp {
+            helper_protocol::PaymentHelperResponse::X402V2 {
+                payment_signature_b64,
+            } => Ok(PaymentProof::X402V2 {
+                payment_signature_b64,
+            }),
+            other => anyhow::bail!("payment helper rail mismatch: expected x402_v2, got {other:?}"),
         }
     }
 }
@@ -399,5 +449,57 @@ mod tests {
         let h = format_www_authenticate(&ch);
         let parsed = parse_www_authenticate(&h).unwrap();
         assert_eq!(parsed, ch);
+    }
+
+    #[test]
+    fn x402_b64_round_trip_payment_required() {
+        let pr = x402::PaymentRequired {
+            x402_version: 2,
+            error: Some("missing payment".to_string()),
+            resource: x402::ResourceInfo {
+                url: "https://api.example.com/premium".to_string(),
+                description: Some("premium".to_string()),
+                mime_type: Some("application/json".to_string()),
+            },
+            accepts: vec![x402::PaymentRequirements {
+                scheme: "exact".to_string(),
+                network: "eip155:84532".to_string(),
+                amount: "10000".to_string(),
+                asset: "0x0000000000000000000000000000000000000000".to_string(),
+                pay_to: "0x1111111111111111111111111111111111111111".to_string(),
+                max_timeout_seconds: 60,
+                extra: serde_json::json!({"assetTransferMethod":"eip3009","name":"USD Coin","version":"2"}),
+            }],
+            extensions: serde_json::json!({}),
+        };
+        let b64 = x402::encode_payment_required_b64(&pr).unwrap();
+        let parsed = x402::decode_payment_required_b64(&b64).unwrap();
+        assert_eq!(parsed, pr);
+    }
+
+    #[test]
+    fn x402_b64_round_trip_payment_payload() {
+        let payload = x402::PaymentPayload {
+            x402_version: 2,
+            resource: Some(x402::ResourceInfo {
+                url: "https://api.example.com/premium".to_string(),
+                description: None,
+                mime_type: None,
+            }),
+            accepted: x402::PaymentRequirements {
+                scheme: "exact".to_string(),
+                network: "eip155:84532".to_string(),
+                amount: "10000".to_string(),
+                asset: "0x0000000000000000000000000000000000000000".to_string(),
+                pay_to: "0x1111111111111111111111111111111111111111".to_string(),
+                max_timeout_seconds: 60,
+                extra: serde_json::json!({"assetTransferMethod":"eip3009","name":"USD Coin","version":"2"}),
+            },
+            payload: serde_json::json!({"signature":"0x00","authorization":{"from":"0x00","to":"0x00","value":"1","validAfter":"0","validBefore":"1","nonce":"0x00"}}),
+            extensions: serde_json::json!({}),
+        };
+        let b64 = x402::encode_payment_payload_b64(&payload).unwrap();
+        let parsed = x402::decode_payment_payload_b64(&b64).unwrap();
+        assert_eq!(parsed, payload);
     }
 }

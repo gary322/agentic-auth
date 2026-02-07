@@ -10,11 +10,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
 use briefcase_dpop::{jwk_thumbprint_b64url, verify_dpop_jwt};
+use briefcase_payments::x402 as x402_v2;
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use hmac::{Hmac, Mac};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
-use rand::Rng as _;
+use rand::{Rng as _, RngCore as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::Mutex;
@@ -24,6 +25,14 @@ use url::Url;
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
+
+// x402 v2 offer defaults for the reference provider gateway.
+const X402_V2_NETWORK: &str = "eip155:84532"; // Base Sepolia
+const X402_V2_ASSET: &str = "0x036CbD53842c5426634e7929541eC2318f3dCF7e"; // USDC (Base Sepolia)
+const X402_V2_PAY_TO: &str = "0x209693Bc6afc0C5328bA36FaF03C514EF312287C";
+const X402_V2_TOKEN_NAME: &str = "USD Coin";
+const X402_V2_TOKEN_VERSION: &str = "2";
+const X402_V2_MAX_TIMEOUT_SECONDS: i64 = 60;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -55,6 +64,7 @@ struct AppState {
     pending_l402: Arc<Mutex<HashMap<String, PendingL402>>>,
     usage: Arc<Mutex<HashMap<String, i64>>>, // jti -> calls
     used_dpop_jtis: Arc<Mutex<HashMap<String, i64>>>, // `${jkt}:${jti}` -> iat
+    used_x402_nonces: Arc<Mutex<HashMap<String, i64>>>, // nonce -> iat
     oauth_codes: Arc<Mutex<HashMap<String, OAuthCode>>>, // code -> record
     oauth_refresh: Arc<Mutex<HashMap<String, OAuthRefresh>>>, // refresh -> record
     oauth_access: Arc<Mutex<HashMap<String, OAuthAccess>>>, // access -> record
@@ -225,6 +235,7 @@ async fn main() -> anyhow::Result<()> {
         pending_l402: Arc::new(Mutex::new(HashMap::new())),
         usage: Arc::new(Mutex::new(HashMap::new())),
         used_dpop_jtis: Arc::new(Mutex::new(HashMap::new())),
+        used_x402_nonces: Arc::new(Mutex::new(HashMap::new())),
         oauth_codes: Arc::new(Mutex::new(HashMap::new())),
         oauth_refresh: Arc::new(Mutex::new(HashMap::new())),
         oauth_access: Arc::new(Mutex::new(HashMap::new())),
@@ -420,6 +431,45 @@ fn prune_used_dpop_jtis(used: &mut HashMap<String, i64>) {
     used.retain(|_, iat| *iat >= cutoff);
 }
 
+fn prune_used_x402_nonces(used: &mut HashMap<String, i64>) {
+    let now = Utc::now().timestamp();
+    // x402 authorizations are short-lived; keep a bounded replay cache.
+    let cutoff = now - (60 * 60);
+    used.retain(|_, iat| *iat >= cutoff);
+}
+
+fn x402_v2_payment_required_for_request(
+    st: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> Result<x402_v2::PaymentRequired, StatusCode> {
+    let url = expected_request_url(headers, uri)?;
+
+    Ok(x402_v2::PaymentRequired {
+        x402_version: 2,
+        error: Some("PAYMENT-SIGNATURE header is required".to_string()),
+        resource: x402_v2::ResourceInfo {
+            url: url.to_string(),
+            description: Some("Capability token for paid quote tool".to_string()),
+            mime_type: Some("application/json".to_string()),
+        },
+        accepts: vec![x402_v2::PaymentRequirements {
+            scheme: "exact".to_string(),
+            network: X402_V2_NETWORK.to_string(),
+            amount: st.cost_microusd.to_string(),
+            asset: X402_V2_ASSET.to_string(),
+            pay_to: X402_V2_PAY_TO.to_string(),
+            max_timeout_seconds: X402_V2_MAX_TIMEOUT_SECONDS,
+            extra: serde_json::json!({
+                "assetTransferMethod": "eip3009",
+                "name": X402_V2_TOKEN_NAME,
+                "version": X402_V2_TOKEN_VERSION,
+            }),
+        }],
+        extensions: serde_json::json!({}),
+    })
+}
+
 async fn token(State(st): State<AppState>, uri: Uri, headers: HeaderMap) -> Response {
     // Optional DPoP binding: if a valid DPoP proof is present, bind the minted capability to the
     // proof's JWK thumbprint (cnf.jkt).
@@ -518,6 +568,114 @@ async fn token(State(st): State<AppState>, uri: Uri, headers: HeaderMap) -> Resp
             .into_response();
     }
 
+    // x402 v2 (HTTP transport): `PAYMENT-SIGNATURE` header with base64-encoded PaymentPayload.
+    if let Some(sig) = headers
+        .get(x402_v2::HEADER_PAYMENT_SIGNATURE)
+        .and_then(|h| h.to_str().ok())
+    {
+        let required = match x402_v2_payment_required_for_request(&st, &headers, &uri) {
+            Ok(r) => r,
+            Err(sc) => {
+                return (sc, Json(serde_json::json!({"error":"invalid_request_url"})))
+                    .into_response();
+            }
+        };
+
+        let payment_payload = match x402_v2::decode_payment_payload_b64(sig) {
+            Ok(p) => p,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":"invalid_payment_signature"})),
+                )
+                    .into_response();
+            }
+        };
+
+        let Some(offered) = required.accepts.first() else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"no_payment_accepts"})),
+            )
+                .into_response();
+        };
+
+        if &payment_payload.accepted != offered {
+            return (
+                StatusCode::PAYMENT_REQUIRED,
+                Json(serde_json::json!({"error":"payment_terms_mismatch"})),
+            )
+                .into_response();
+        }
+
+        let payer = match x402_v2::evm::verify_eip3009_payload(&required, &payment_payload) {
+            Ok(p) => p,
+            Err(_) => {
+                return (
+                    StatusCode::PAYMENT_REQUIRED,
+                    Json(serde_json::json!({"error":"payment_invalid"})),
+                )
+                    .into_response();
+            }
+        };
+
+        // Best-effort replay protection for the demo gateway: real deployments should settle on-chain
+        // (or via a facilitator) which makes the nonce authoritative.
+        let scheme_payload: x402_v2::evm::ExactEvmEip3009Payload =
+            match serde_json::from_value(payment_payload.payload.clone()) {
+                Ok(v) => v,
+                Err(_) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error":"invalid_payment_payload"})),
+                    )
+                        .into_response();
+                }
+            };
+
+        {
+            let mut used = st.used_x402_nonces.lock().await;
+            prune_used_x402_nonces(&mut used);
+            if used.contains_key(&scheme_payload.authorization.nonce) {
+                return (
+                    StatusCode::PAYMENT_REQUIRED,
+                    Json(serde_json::json!({"error":"payment_replay"})),
+                )
+                    .into_response();
+            }
+            used.insert(scheme_payload.authorization.nonce, Utc::now().timestamp());
+        }
+
+        let token = issue_capability_jwt(&st, cnf_jkt.clone());
+
+        let mut tx = [0u8; 32];
+        rand::rng().fill_bytes(&mut tx);
+        let settlement = x402_v2::SettlementResponse {
+            success: true,
+            error_reason: None,
+            payer: Some(payer),
+            transaction: format!("0x{}", hex::encode(tx)),
+            network: payment_payload.accepted.network,
+        };
+        let settlement_b64 = match x402_v2::encode_settlement_response_b64(&settlement) {
+            Ok(v) => v,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error":"payment_response_encode_failed"})),
+                )
+                    .into_response();
+            }
+        };
+
+        let mut resp = (StatusCode::OK, Json(token)).into_response();
+        if let Ok(hv) = HeaderValue::from_str(&settlement_b64) {
+            resp.headers_mut()
+                .insert(x402_v2::HEADER_PAYMENT_RESPONSE, hv);
+        }
+        return resp;
+    }
+
     // Accept either x402 proof or l402 macaroon/preimage for the demo.
     // Preferred: Authorization schemes (more standard).
     if let Some(authz) = headers.get("authorization").and_then(|h| h.to_str().ok()) {
@@ -584,7 +742,15 @@ async fn token(State(st): State<AppState>, uri: Uri, headers: HeaderMap) -> Resp
         payment_url: "/pay".to_string(),
         amount_microusd: st.cost_microusd,
     };
-    payment_required_response(challenge)
+    let mut resp = payment_required_response(challenge);
+    if let Ok(required) = x402_v2_payment_required_for_request(&st, &headers, &uri)
+        && let Ok(b64) = x402_v2::encode_payment_required_b64(&required)
+        && let Ok(hv) = HeaderValue::from_str(&b64)
+    {
+        resp.headers_mut()
+            .insert(x402_v2::HEADER_PAYMENT_REQUIRED, hv);
+    }
+    resp
 }
 
 async fn pay(
@@ -1015,6 +1181,7 @@ mod tests {
             pending_l402: Arc::new(Mutex::new(HashMap::new())),
             usage: Arc::new(Mutex::new(HashMap::new())),
             used_dpop_jtis: Arc::new(Mutex::new(HashMap::new())),
+            used_x402_nonces: Arc::new(Mutex::new(HashMap::new())),
             oauth_codes: Arc::new(Mutex::new(HashMap::new())),
             oauth_refresh: Arc::new(Mutex::new(HashMap::new())),
             oauth_access: Arc::new(Mutex::new(HashMap::new())),

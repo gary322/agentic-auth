@@ -26,7 +26,7 @@ jobs:
 
       - name: Build
         # Keep this a single line so it runs under both bash (unix) and pwsh (Windows).
-        run: cargo build --release -p briefcased -p briefcase-cli -p mcp-gateway -p agent-access-gateway -p briefcase-ui
+        run: cargo build --release -p briefcased -p briefcase-cli -p mcp-gateway -p agent-access-gateway -p briefcase-ui -p briefcase-payment-helper
 
       - name: Package (unix)
         if: runner.os != 'Windows'
@@ -41,6 +41,7 @@ jobs:
           cp target/release/mcp-gateway "dist/${name}/"
           cp target/release/agent-access-gateway "dist/${name}/"
           cp target/release/briefcase-ui "dist/${name}/"
+          cp target/release/briefcase-payment-helper "dist/${name}/"
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"
 
       - name: Package (windows)
@@ -55,6 +56,7 @@ jobs:
           Copy-Item "target/release/mcp-gateway.exe" "dist/$name/"
           Copy-Item "target/release/agent-access-gateway.exe" "dist/$name/"
           Copy-Item "target/release/briefcase-ui.exe" "dist/$name/"
+          Copy-Item "target/release/briefcase-payment-helper.exe" "dist/$name/"
           Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
 
       - name: Upload artifacts
