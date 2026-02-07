@@ -74,6 +74,18 @@ export interface paths {
     /** Set daily budget for a category (micro-USD) */
     post: operations["setBudget"];
   };
+  "/v1/policy": {
+    /** Get current Cedar policy text */
+    get: operations["policyGet"];
+  };
+  "/v1/policy/compile": {
+    /** Compile a natural-language policy prompt into a Cedar policy proposal */
+    post: operations["policyCompile"];
+  };
+  "/v1/policy/proposals/{id}/apply": {
+    /** Apply a previously-compiled policy proposal (requires user approval) */
+    post: operations["policyApply"];
+  };
   "/v1/tools": {
     /** List tools */
     get: operations["listTools"];
@@ -220,6 +232,56 @@ export interface components {
       /** Format: int64 */
       daily_limit_microusd: number;
     };
+    PolicyGetResponse: {
+      policy_text: string;
+      policy_hash_hex: string;
+      /** Format: date-time */
+      updated_at_rfc3339: string;
+    };
+    PolicyCompileRequest: {
+      prompt: string;
+    };
+    /** @enum {string} */
+    PolicyDiffOp: "context" | "add" | "remove";
+    PolicyDiffLine: {
+      op: components["schemas"]["PolicyDiffOp"];
+      text: string;
+    };
+    PolicyProposal: {
+      /** Format: uuid */
+      id: string;
+      /** Format: date-time */
+      created_at_rfc3339: string;
+      /** Format: date-time */
+      expires_at_rfc3339: string;
+      prompt: string;
+      base_policy_hash_hex: string;
+      proposed_policy_hash_hex: string;
+      diff: components["schemas"]["PolicyDiffLine"][];
+      proposed_policy_text: string;
+    };
+    PolicyCompileResponse: {
+      proposal: components["schemas"]["PolicyProposal"];
+    };
+    PolicyApplyResponse: OneOf<[{
+      /** @constant */
+      status: "applied";
+      policy_hash_hex: string;
+      /** Format: date-time */
+      updated_at_rfc3339: string;
+    }, {
+      /** @constant */
+      status: "approval_required";
+      approval: components["schemas"]["ApprovalRequest"];
+    }, {
+      /** @constant */
+      status: "denied";
+      reason: string;
+    }, {
+      /** @constant */
+      status: "error";
+      message: string;
+    }]>;
     /**
      * @description Matches `briefcase_core::ToolCategory`.
      * Most tools use string categories `read|write|admin`.
@@ -787,6 +849,73 @@ export interface operations {
       400: {
         content: {
           "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+      /** @description unauthorized */
+      401: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+    };
+  };
+  /** Get current Cedar policy text */
+  policyGet: {
+    responses: {
+      /** @description ok */
+      200: {
+        content: {
+          "application/json": components["schemas"]["PolicyGetResponse"];
+        };
+      };
+      /** @description unauthorized */
+      401: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+    };
+  };
+  /** Compile a natural-language policy prompt into a Cedar policy proposal */
+  policyCompile: {
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["PolicyCompileRequest"];
+      };
+    };
+    responses: {
+      /** @description ok */
+      200: {
+        content: {
+          "application/json": components["schemas"]["PolicyCompileResponse"];
+        };
+      };
+      /** @description bad request */
+      400: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+      /** @description unauthorized */
+      401: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+    };
+  };
+  /** Apply a previously-compiled policy proposal (requires user approval) */
+  policyApply: {
+    parameters: {
+      path: {
+        id: string;
+      };
+    };
+    responses: {
+      /** @description ok */
+      200: {
+        content: {
+          "application/json": components["schemas"]["PolicyApplyResponse"];
         };
       };
       /** @description unauthorized */

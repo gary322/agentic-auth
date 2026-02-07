@@ -89,6 +89,26 @@ pub struct VcStatusListCacheRecord {
     pub expires_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PolicyRecord {
+    pub policy_text: String,
+    pub policy_hash_hex: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PolicyProposalRecord {
+    pub id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub prompt: String,
+    pub base_policy_hash_hex: String,
+    pub proposed_policy_text: String,
+    pub proposed_policy_hash_hex: String,
+    pub diff_json: String,
+    pub approval_id: Option<Uuid>,
+}
+
 impl Db {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
@@ -147,6 +167,27 @@ impl Db {
                       created_at_rfc3339      TEXT NOT NULL,
                       text                    TEXT NOT NULL
                     );
+
+                    CREATE TABLE IF NOT EXISTS policy (
+                      id                 INTEGER PRIMARY KEY CHECK (id = 1),
+                      policy_text        TEXT NOT NULL,
+                      policy_hash_hex    TEXT NOT NULL,
+                      updated_at_rfc3339 TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS policy_proposals (
+                      id                      TEXT PRIMARY KEY,
+                      created_at_rfc3339      TEXT NOT NULL,
+                      expires_at_rfc3339      TEXT NOT NULL,
+                      prompt                  TEXT NOT NULL,
+                      base_policy_hash_hex    TEXT NOT NULL,
+                      proposed_policy_text    TEXT NOT NULL,
+                      proposed_policy_hash_hex TEXT NOT NULL,
+                      diff_json               TEXT NOT NULL,
+                      approval_id             TEXT
+                    );
+
+                    CREATE INDEX IF NOT EXISTS policy_proposals_expires_idx ON policy_proposals(expires_at_rfc3339);
 
                     CREATE TABLE IF NOT EXISTS identity (
                       id                INTEGER PRIMARY KEY CHECK (id = 1),
@@ -1164,12 +1205,277 @@ impl Db {
         Ok(ids)
     }
 
+    pub async fn policy(&self) -> anyhow::Result<Option<PolicyRecord>> {
+        self.conn
+            .call(|conn| {
+                let row: Option<(String, String, String)> = conn
+                    .query_row(
+                        "SELECT policy_text, policy_hash_hex, updated_at_rfc3339 FROM policy WHERE id=1",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .optional()?;
+                let Some((policy_text, policy_hash_hex, updated_at_rfc3339)) = row else {
+                    return Ok(None);
+                };
+                let updated_at = updated_at_rfc3339.parse::<DateTime<Utc>>().map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+                Ok(Some(PolicyRecord {
+                    policy_text,
+                    policy_hash_hex,
+                    updated_at,
+                }))
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn upsert_policy(&self, policy_text: &str) -> anyhow::Result<PolicyRecord> {
+        let policy_text = policy_text.to_string();
+        let policy_hash_hex = sha256_hex(policy_text.as_bytes());
+        let updated_at = Utc::now().to_rfc3339();
+
+        let policy_text_db = policy_text.clone();
+        let policy_hash_hex_db = policy_hash_hex.clone();
+        let updated_at_db = updated_at.clone();
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    r#"
+                    INSERT INTO policy(id, policy_text, policy_hash_hex, updated_at_rfc3339)
+                    VALUES (1, ?1, ?2, ?3)
+                    ON CONFLICT(id) DO UPDATE SET
+                      policy_text=excluded.policy_text,
+                      policy_hash_hex=excluded.policy_hash_hex,
+                      updated_at_rfc3339=excluded.updated_at_rfc3339
+                    "#,
+                    params![policy_text_db, policy_hash_hex_db, updated_at_db],
+                )?;
+                Ok(())
+            })
+            .await?;
+
+        Ok(PolicyRecord {
+            policy_text,
+            policy_hash_hex,
+            updated_at: updated_at.parse::<DateTime<Utc>>()?,
+        })
+    }
+
+    pub async fn ensure_policy(&self, default_policy_text: &str) -> anyhow::Result<PolicyRecord> {
+        if let Some(p) = self.policy().await? {
+            return Ok(p);
+        }
+        self.upsert_policy(default_policy_text).await
+    }
+
+    pub async fn create_policy_proposal(
+        &self,
+        prompt: &str,
+        base_policy_hash_hex: &str,
+        proposed_policy_text: &str,
+        proposed_policy_hash_hex: &str,
+        diff_json: &str,
+    ) -> anyhow::Result<PolicyProposalRecord> {
+        let id = Uuid::new_v4();
+        let created_at = Utc::now();
+        let expires_at = created_at + Duration::minutes(10);
+
+        let prompt = prompt.to_string();
+        let base_policy_hash_hex = base_policy_hash_hex.to_string();
+        let proposed_policy_text = proposed_policy_text.to_string();
+        let proposed_policy_hash_hex = proposed_policy_hash_hex.to_string();
+        let diff_json = diff_json.to_string();
+        let created_at_rfc3339 = created_at.to_rfc3339();
+        let expires_at_rfc3339 = expires_at.to_rfc3339();
+
+        let prompt_db = prompt.clone();
+        let base_policy_hash_hex_db = base_policy_hash_hex.clone();
+        let proposed_policy_text_db = proposed_policy_text.clone();
+        let proposed_policy_hash_hex_db = proposed_policy_hash_hex.clone();
+        let diff_json_db = diff_json.clone();
+        let created_at_rfc3339_db = created_at_rfc3339.clone();
+        let expires_at_rfc3339_db = expires_at_rfc3339.clone();
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    r#"
+                    INSERT INTO policy_proposals(
+                      id,
+                      created_at_rfc3339,
+                      expires_at_rfc3339,
+                      prompt,
+                      base_policy_hash_hex,
+                      proposed_policy_text,
+                      proposed_policy_hash_hex,
+                      diff_json,
+                      approval_id
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)
+                    "#,
+                    params![
+                        id.to_string(),
+                        created_at_rfc3339_db,
+                        expires_at_rfc3339_db,
+                        prompt_db,
+                        base_policy_hash_hex_db,
+                        proposed_policy_text_db,
+                        proposed_policy_hash_hex_db,
+                        diff_json_db,
+                    ],
+                )?;
+                Ok(())
+            })
+            .await?;
+
+        Ok(PolicyProposalRecord {
+            id,
+            created_at,
+            expires_at,
+            prompt,
+            base_policy_hash_hex,
+            proposed_policy_text,
+            proposed_policy_hash_hex,
+            diff_json,
+            approval_id: None,
+        })
+    }
+
+    pub async fn policy_proposal(&self, id: Uuid) -> anyhow::Result<Option<PolicyProposalRecord>> {
+        let id_s = id.to_string();
+        self.conn
+            .call(move |conn| {
+                // Expire proposals opportunistically.
+                let now = Utc::now().to_rfc3339();
+                conn.execute(
+                    "DELETE FROM policy_proposals WHERE expires_at_rfc3339 < ?1",
+                    params![now],
+                )?;
+
+                let row: Option<PolicyProposalRecord> = conn
+                    .query_row(
+                        r#"
+                        SELECT id, created_at_rfc3339, expires_at_rfc3339, prompt, base_policy_hash_hex,
+                               proposed_policy_text, proposed_policy_hash_hex, diff_json, approval_id
+                        FROM policy_proposals WHERE id=?1
+                        "#,
+                        params![id_s],
+                        |r| {
+                            let id_s: String = r.get(0)?;
+                            let created_at_s: String = r.get(1)?;
+                            let expires_at_s: String = r.get(2)?;
+                            let prompt: String = r.get(3)?;
+                            let base_hash: String = r.get(4)?;
+                            let proposed_text: String = r.get(5)?;
+                            let proposed_hash: String = r.get(6)?;
+                            let diff_json: String = r.get(7)?;
+                            let approval_id_s: Option<String> = r.get(8)?;
+
+                            let created_at = created_at_s.parse::<DateTime<Utc>>().map_err(|e| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    1,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(e),
+                                )
+                            })?;
+                            let expires_at = expires_at_s.parse::<DateTime<Utc>>().map_err(|e| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    2,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(e),
+                                )
+                            })?;
+
+                            let id = Uuid::parse_str(&id_s).map_err(|e| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    0,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(e),
+                                )
+                            })?;
+                            let approval_id = match approval_id_s {
+                                Some(s) => Some(Uuid::parse_str(&s).map_err(|e| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        8,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(e),
+                                    )
+                                })?),
+                                None => None,
+                            };
+
+                            Ok(PolicyProposalRecord {
+                                id,
+                                created_at,
+                                expires_at,
+                                prompt,
+                                base_policy_hash_hex: base_hash,
+                                proposed_policy_text: proposed_text,
+                                proposed_policy_hash_hex: proposed_hash,
+                                diff_json,
+                                approval_id,
+                            })
+                        },
+                    )
+                    .optional()?;
+                Ok(row)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn set_policy_proposal_approval_id(
+        &self,
+        proposal_id: Uuid,
+        approval_id: Uuid,
+    ) -> anyhow::Result<()> {
+        let proposal_id_s = proposal_id.to_string();
+        let approval_id_s = approval_id.to_string();
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE policy_proposals SET approval_id=?1 WHERE id=?2",
+                    params![approval_id_s, proposal_id_s],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_policy_proposal(&self, id: Uuid) -> anyhow::Result<()> {
+        let id_s = id.to_string();
+        self.conn
+            .call(move |conn| {
+                conn.execute("DELETE FROM policy_proposals WHERE id=?1", params![id_s])?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
     pub async fn create_approval(
         &self,
         tool_id: &str,
         reason: &str,
         kind: ApprovalKind,
         args: &serde_json::Value,
+    ) -> anyhow::Result<ApprovalRequest> {
+        self.create_approval_with_summary(tool_id, reason, kind, args, None)
+            .await
+    }
+
+    pub async fn create_approval_with_summary(
+        &self,
+        tool_id: &str,
+        reason: &str,
+        kind: ApprovalKind,
+        args: &serde_json::Value,
+        summary_override: Option<serde_json::Value>,
     ) -> anyhow::Result<ApprovalRequest> {
         let id = Uuid::new_v4();
         let created_at = Utc::now();
@@ -1182,11 +1488,15 @@ impl Db {
             ApprovalKind::MobileSigner => "mobile_signer",
         }
         .to_string();
-        let summary = serde_json::json!({
-            "tool_id": tool_id,
-            "reason": reason,
-            "kind": kind_s,
-            "args_hash": sha256_hex(serde_json::to_vec(args)?.as_slice()),
+        let args_hash = sha256_hex(serde_json::to_vec(args)?.as_slice());
+        let kind_s_for_summary = kind_s.clone();
+        let summary = summary_override.unwrap_or_else(|| {
+            serde_json::json!({
+                "tool_id": tool_id,
+                "reason": reason,
+                "kind": kind_s_for_summary,
+                "args_hash": args_hash,
+            })
         });
         let summary_json = serde_json::to_string(&summary)?;
         let call_hash_hex = sha256_hex(

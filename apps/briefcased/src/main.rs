@@ -15,6 +15,7 @@ mod db;
 mod firewall;
 mod middleware;
 mod pairing;
+mod policy_compiler;
 mod provider;
 mod remote_mcp;
 mod tools;

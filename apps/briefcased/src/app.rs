@@ -42,6 +42,7 @@ use briefcase_policy::{CedarPolicyEngine, CedarPolicyEngineOptions, ToolPolicyCo
 use briefcase_receipts::{ReceiptStore, ReceiptStoreOptions};
 use briefcase_secrets::SecretStore;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, Default)]
 pub struct AppOptions {
@@ -82,7 +83,7 @@ pub struct AppState {
     pub auth_token: String,
     pub db: Db,
     pub receipts: ReceiptStore,
-    pub policy: Arc<CedarPolicyEngine>,
+    pub policy: Arc<RwLock<Arc<CedarPolicyEngine>>>,
     pub risk: Arc<briefcase_risk::RiskEngine>,
     pub http: reqwest::Client,
     pub provider: Arc<ProviderClient>,
@@ -133,9 +134,12 @@ impl AppState {
 
         let receipts = ReceiptStore::open(ReceiptStoreOptions::new(db_path.to_path_buf())).await?;
 
-        let policy = Arc::new(CedarPolicyEngine::new(
-            CedarPolicyEngineOptions::default_policies(),
-        )?);
+        let default_policy_text = CedarPolicyEngineOptions::default_policies().policy_text;
+        let policy_rec = db.ensure_policy(&default_policy_text).await?;
+        let policy_engine = CedarPolicyEngine::new(CedarPolicyEngineOptions {
+            policy_text: policy_rec.policy_text,
+        })?;
+        let policy = Arc::new(RwLock::new(Arc::new(policy_engine)));
 
         let classifier_url = match std::env::var("BRIEFCASE_RISK_CLASSIFIER_URL")
             .ok()
@@ -351,6 +355,15 @@ fn router(state: AppState) -> Router {
         .route("/v1/mcp/servers/{id}/oauth/revoke", post(revoke_mcp_oauth))
         .route("/v1/budgets", get(list_budgets))
         .route("/v1/budgets/{category}", post(set_budget))
+        .route("/v1/policy", get(crate::policy_compiler::policy_get))
+        .route(
+            "/v1/policy/compile",
+            post(crate::policy_compiler::policy_compile),
+        )
+        .route(
+            "/v1/policy/proposals/{id}/apply",
+            post(crate::policy_compiler::policy_apply),
+        )
         .route("/v1/providers/{id}/oauth/exchange", post(oauth_exchange))
         .route("/v1/providers/{id}/vc/fetch", post(fetch_vc))
         .route("/v1/tools", get(list_tools))
@@ -1624,7 +1637,8 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
     }
 
     // Cedar policy: allow/deny/require-approval.
-    let decision = state.policy.decide("local-user", spec, policy_ctx)?;
+    let policy = state.policy.read().await.clone();
+    let decision = policy.decide("local-user", spec, policy_ctx)?;
     match &decision {
         PolicyDecision::Deny { reason } => {
             state
@@ -3869,6 +3883,80 @@ mod tests {
 
         daemon_task.abort();
         provider_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn policy_compile_and_apply_changes_enforcement() -> anyhow::Result<()> {
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let (_state, _daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
+
+        // Echo succeeds under the default policy.
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "echo".to_string(),
+                    args: serde_json::json!({ "text": "hi" }),
+                    context: ToolCallContext::new(),
+                    approval_token: None,
+                },
+            })
+            .await?;
+        assert!(matches!(resp, CallToolResponse::Ok { .. }));
+
+        // Compile a strict policy (forces approvals for all calls).
+        let cur = client.policy_get().await?;
+        let compiled = client
+            .policy_compile(briefcase_api::types::PolicyCompileRequest {
+                prompt: "strict".to_string(),
+            })
+            .await?;
+        assert_eq!(compiled.proposal.base_policy_hash_hex, cur.policy_hash_hex);
+
+        // Applying should require approval.
+        let applied = client.policy_apply(&compiled.proposal.id).await?;
+        let approval_id = match applied {
+            briefcase_api::types::PolicyApplyResponse::ApprovalRequired { approval } => {
+                assert_eq!(approval.tool_id, "policy.apply");
+                approval.id
+            }
+            other => anyhow::bail!("expected approval_required, got {other:?}"),
+        };
+
+        client.approve(&approval_id).await?;
+
+        let applied = client.policy_apply(&compiled.proposal.id).await?;
+        assert!(matches!(
+            applied,
+            briefcase_api::types::PolicyApplyResponse::Applied { .. }
+        ));
+
+        // Echo now requires approval (policy changed).
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "echo".to_string(),
+                    args: serde_json::json!({ "text": "hi2" }),
+                    context: ToolCallContext::new(),
+                    approval_token: None,
+                },
+            })
+            .await?;
+        assert!(matches!(resp, CallToolResponse::ApprovalRequired { .. }));
+
+        // Receipt should include a policy update event.
+        let receipts = client.list_receipts_paged(200, 0).await?.receipts;
+        assert!(receipts.iter().any(|r| {
+            r.event
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .is_some_and(|k| k == "policy_update")
+        }));
+
+        provider_task.abort();
+        daemon_task.abort();
         Ok(())
     }
 

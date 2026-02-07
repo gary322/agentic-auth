@@ -20,6 +20,7 @@
           <button class="tab" data-tab="approvals" type="button">Approvals</button>
           <button class="tab" data-tab="receipts" type="button">Receipts</button>
           <button class="tab" data-tab="budgets" type="button">Budgets</button>
+          <button class="tab" data-tab="policy" type="button">Policy</button>
         </nav>
       </header>
 
@@ -138,6 +139,38 @@
             <button id="refresh-budgets" class="small" type="button">Refresh</button>
           </div>
           <div id="budgets" class="list"></div>
+        </section>
+      </section>
+
+      <section id="tab-policy" class="tabpane hidden">
+        <section class="card">
+          <h2>Policy Compiler</h2>
+          <p class="hint">
+            Try: <code>strict</code>, <code>relaxed</code>, <code>default</code>, or
+            <code>cedar:&lt;cedar policy text&gt;</code>.
+          </p>
+          <form id="policy-compile-form">
+            <label>
+              Prompt
+              <textarea
+                id="policy-prompt"
+                name="prompt"
+                rows="4"
+                required
+                maxlength="4000"
+                placeholder="strict"
+              ></textarea>
+            </label>
+            <button type="submit">Compile</button>
+          </form>
+        </section>
+
+        <section class="card">
+          <div class="card-head">
+            <h2>Proposal</h2>
+            <button id="policy-refresh" class="small" type="button">Refresh</button>
+          </div>
+          <div id="policy-proposal" class="list"></div>
         </section>
       </section>
     </main>

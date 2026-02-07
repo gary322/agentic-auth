@@ -273,7 +273,7 @@ For each task, include:
   - **Verify**: `cargo test -p briefcase-ai`
   - _Reqs: FR-11, AC-8.2_
 
-- [ ] 10.2 Implement policy compiler (proposal + diff + apply)
+- [x] 10.2 Implement policy compiler (proposal + diff + apply)
   - **Do**: implement compile endpoint returning Cedar diffs; require user confirmation (and optional mobile signer) to apply.
   - **Files**: `apps/briefcased/src/policy_compiler.rs` (new), `apps/briefcase-extension/*`
   - **Done when**: user can type natural language policy and apply a verified diff.

@@ -82,6 +82,7 @@ url = "2.5.4"
 wasmtime = "40.0.3"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 zeroize = { version = "1.8.1", features = ["derive"] }
+similar = "2.7.0"
 
 # Lightning / gRPC (Phase 8).
 lightning-invoice = "0.34.0"

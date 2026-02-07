@@ -135,6 +135,68 @@ pub struct SetBudgetRequest {
     pub daily_limit_microusd: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyGetResponse {
+    pub policy_text: String,
+    pub policy_hash_hex: String,
+    pub updated_at_rfc3339: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyCompileRequest {
+    /// Natural language policy request (untrusted input).
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyDiffOp {
+    Context,
+    Add,
+    Remove,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PolicyDiffLine {
+    pub op: PolicyDiffOp,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyProposal {
+    pub id: Uuid,
+    pub created_at_rfc3339: String,
+    pub expires_at_rfc3339: String,
+    pub prompt: String,
+    pub base_policy_hash_hex: String,
+    pub proposed_policy_hash_hex: String,
+    pub diff: Vec<PolicyDiffLine>,
+    pub proposed_policy_text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyCompileResponse {
+    pub proposal: PolicyProposal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PolicyApplyResponse {
+    Applied {
+        policy_hash_hex: String,
+        updated_at_rfc3339: String,
+    },
+    ApprovalRequired {
+        approval: ApprovalRequest,
+    },
+    Denied {
+        reason: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SignerAlgorithm {

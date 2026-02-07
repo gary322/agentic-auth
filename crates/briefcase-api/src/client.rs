@@ -19,7 +19,8 @@ use crate::types::{
     ListApprovalsResponse, ListBudgetsResponse, ListMcpServersResponse, ListProvidersResponse,
     ListReceiptsResponse, ListToolsResponse, McpOAuthExchangeRequest, McpOAuthExchangeResponse,
     McpOAuthStartRequest, McpOAuthStartResponse, McpServerSummary, OAuthExchangeRequest,
-    OAuthExchangeResponse, ProviderSummary, RevokeMcpOAuthResponse, RevokeProviderOAuthResponse,
+    OAuthExchangeResponse, PolicyApplyResponse, PolicyCompileRequest, PolicyCompileResponse,
+    PolicyGetResponse, ProviderSummary, RevokeMcpOAuthResponse, RevokeProviderOAuthResponse,
     SetBudgetRequest, SignerPairCompleteRequest, SignerPairCompleteResponse,
     SignerPairStartResponse, UpsertMcpServerRequest, UpsertProviderRequest, VerifyReceiptsResponse,
 };
@@ -184,6 +185,28 @@ impl BriefcaseClient {
             SetBudgetRequest {
                 daily_limit_microusd,
             },
+        )
+        .await
+    }
+
+    pub async fn policy_get(&self) -> Result<PolicyGetResponse, BriefcaseClientError> {
+        self.get_json("/v1/policy").await
+    }
+
+    pub async fn policy_compile(
+        &self,
+        req: PolicyCompileRequest,
+    ) -> Result<PolicyCompileResponse, BriefcaseClientError> {
+        self.post_json("/v1/policy/compile", req).await
+    }
+
+    pub async fn policy_apply(
+        &self,
+        proposal_id: &uuid::Uuid,
+    ) -> Result<PolicyApplyResponse, BriefcaseClientError> {
+        self.post_json(
+            &format!("/v1/policy/proposals/{proposal_id}/apply"),
+            serde_json::json!({}),
         )
         .await
     }

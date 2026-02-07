@@ -21,6 +21,40 @@ type BudgetRecord = {
   daily_limit_microusd: number;
 };
 
+type PolicyGetResponse = {
+  policy_text: string;
+  policy_hash_hex: string;
+  updated_at_rfc3339: string;
+};
+
+type PolicyDiffOp = "context" | "add" | "remove";
+
+type PolicyDiffLine = {
+  op: PolicyDiffOp;
+  text: string;
+};
+
+type PolicyProposal = {
+  id: string;
+  created_at_rfc3339: string;
+  expires_at_rfc3339: string;
+  prompt: string;
+  base_policy_hash_hex: string;
+  proposed_policy_hash_hex: string;
+  diff: PolicyDiffLine[];
+  proposed_policy_text: string;
+};
+
+type PolicyCompileResponse = {
+  proposal: PolicyProposal;
+};
+
+type PolicyApplyResponse =
+  | { status: "applied"; policy_hash_hex: string; updated_at_rfc3339: string }
+  | { status: "approval_required"; approval: ApprovalRequest }
+  | { status: "denied"; reason: string }
+  | { status: "error"; message: string };
+
 type ApprovalKind = "local" | "mobile_signer";
 
 type ApprovalRequest = {
@@ -40,6 +74,8 @@ type ReceiptRecord = {
   hash_hex: string;
   event: unknown;
 };
+
+let lastPolicyProposal: PolicyProposal | null = null;
 
 function el<T extends HTMLElement>(id: string): T {
   const e = document.getElementById(id);
@@ -415,6 +451,132 @@ async function loadBudgets(): Promise<void> {
   }
 }
 
+function policyDiffText(diff: PolicyDiffLine[]): string {
+  const out: string[] = [];
+  for (const l of diff) {
+    const prefix = l.op === "add" ? "+" : l.op === "remove" ? "-" : " ";
+    out.push(`${prefix}${l.text}`);
+  }
+  return `${out.join("\n")}\n`;
+}
+
+function renderPolicyPane(current: PolicyGetResponse): void {
+  const root = el<HTMLDivElement>("policy-proposal");
+  root.innerHTML = "";
+
+  const cur = mkItem();
+  cur.appendChild(
+    mkRowLeftRight(
+      "current",
+      mkPill(true, current.policy_hash_hex.slice(0, 12), "policy"),
+    ),
+  );
+  const meta = document.createElement("div");
+  meta.className = "url";
+  meta.innerText = `updated: ${current.updated_at_rfc3339}`;
+  cur.appendChild(meta);
+  const pre = document.createElement("pre");
+  pre.className = "diff";
+  pre.innerText = current.policy_text;
+  cur.appendChild(pre);
+  root.appendChild(cur);
+
+  if (!lastPolicyProposal) {
+    const p = document.createElement("p");
+    p.className = "status";
+    p.innerText = "No compiled proposal yet.";
+    root.appendChild(p);
+    return;
+  }
+
+  const prop = lastPolicyProposal;
+  const box = mkItem();
+  box.appendChild(mkRowLeftRight("proposal", mkPill(true, prop.id, prop.id)));
+
+  const meta2 = document.createElement("div");
+  meta2.className = "url";
+  meta2.innerText = `expires: ${prop.expires_at_rfc3339}`;
+  box.appendChild(meta2);
+
+  const meta3 = document.createElement("div");
+  meta3.className = "url";
+  meta3.innerText = `base: ${prop.base_policy_hash_hex.slice(0, 12)} | proposed: ${prop.proposed_policy_hash_hex.slice(0, 12)}`;
+  box.appendChild(meta3);
+
+  const diff = document.createElement("pre");
+  diff.className = "diff";
+  diff.innerText = policyDiffText(prop.diff);
+  box.appendChild(diff);
+
+  const proposed = document.createElement("pre");
+  proposed.className = "diff";
+  proposed.innerText = prop.proposed_policy_text;
+  box.appendChild(proposed);
+
+  const actions = document.createElement("div");
+  actions.className = "actions";
+
+  const apply = document.createElement("button");
+  apply.className = "connect";
+  apply.type = "button";
+  apply.innerText = "Apply (requires approval)";
+  apply.addEventListener("click", async () => {
+    setStatus("Applying policy proposal...");
+    try {
+      const res = await rpc<PolicyApplyResponse>("policy_apply", {
+        proposal_id: prop.id,
+      });
+      if (res.status === "applied") {
+        lastPolicyProposal = null;
+        await renderAfter(loadPolicy);
+        setStatus("Policy applied.");
+        return;
+      }
+      if (res.status === "approval_required") {
+        const a = res.approval;
+        if (a.kind === "local") {
+          setStatus("Approval required. Approving locally...");
+          await rpc("approve", { id: a.id });
+          const res2 = await rpc<PolicyApplyResponse>("policy_apply", {
+            proposal_id: prop.id,
+          });
+          if (res2.status === "applied") {
+            lastPolicyProposal = null;
+            await renderAfter(loadPolicy);
+            setStatus("Policy applied.");
+          } else if (res2.status === "approval_required") {
+            setStatus("Still pending approval.");
+          } else if (res2.status === "denied") {
+            setStatus(`Denied: ${res2.reason}`);
+          } else {
+            setStatus(res2.message);
+          }
+          return;
+        }
+
+        setStatus("Mobile signer approval required. Approve from the signer app, then click Apply again.");
+        return;
+      }
+      if (res.status === "denied") {
+        setStatus(`Denied: ${res.reason}`);
+        return;
+      }
+      setStatus(res.message);
+    } catch (e) {
+      setStatus(errorMessage(e));
+    }
+  });
+
+  actions.appendChild(apply);
+  box.appendChild(actions);
+  root.appendChild(box);
+}
+
+async function loadPolicy(): Promise<void> {
+  const current = await rpc<PolicyGetResponse>("policy_get");
+  renderPolicyPane(current);
+}
+
 function errorMessage(e: unknown): string {
   return e instanceof Error ? `Error: ${e.message}` : "Error: unknown_error";
 }
@@ -454,6 +616,7 @@ function setupTabs(): void {
       }
       if (tab === "receipts") await loadReceipts();
       if (tab === "budgets") await loadBudgets();
+      if (tab === "policy") await loadPolicy();
       setStatus("");
     } catch (e) {
       setStatus(errorMessage(e));
@@ -503,6 +666,31 @@ function setupActions(): void {
     setStatus("Refreshing...");
     loadBudgets()
       .then(() => setStatus(""))
+      .catch((e) => setStatus(errorMessage(e)));
+  });
+
+  el<HTMLButtonElement>("policy-refresh").addEventListener("click", () => {
+    setStatus("Refreshing...");
+    loadPolicy()
+      .then(() => setStatus(""))
+      .catch((e) => setStatus(errorMessage(e)));
+  });
+
+  el<HTMLFormElement>("policy-compile-form").addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    const prompt = el<HTMLTextAreaElement>("policy-prompt").value.trim();
+    if (!prompt) {
+      setStatus("Error: missing prompt");
+      return;
+    }
+
+    setStatus("Compiling policy...");
+    rpc<PolicyCompileResponse>("policy_compile", { prompt })
+      .then((r) => {
+        lastPolicyProposal = r.proposal;
+      })
+      .then(() => loadPolicy())
+      .then(() => setStatus("Policy compiled. Review and apply."))
       .catch((e) => setStatus(errorMessage(e)));
   });
 

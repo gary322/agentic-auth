@@ -258,6 +258,119 @@ components:
           type: integer
           format: int64
 
+    PolicyGetResponse:
+      type: object
+      required: [policy_text, policy_hash_hex, updated_at_rfc3339]
+      properties:
+        policy_text:
+          type: string
+        policy_hash_hex:
+          type: string
+        updated_at_rfc3339:
+          type: string
+          format: date-time
+
+    PolicyCompileRequest:
+      type: object
+      required: [prompt]
+      properties:
+        prompt:
+          type: string
+
+    PolicyDiffOp:
+      type: string
+      enum: [context, add, remove]
+
+    PolicyDiffLine:
+      type: object
+      required: [op, text]
+      properties:
+        op:
+          $ref: "#/components/schemas/PolicyDiffOp"
+        text:
+          type: string
+
+    PolicyProposal:
+      type: object
+      required:
+        [
+          id,
+          created_at_rfc3339,
+          expires_at_rfc3339,
+          prompt,
+          base_policy_hash_hex,
+          proposed_policy_hash_hex,
+          diff,
+          proposed_policy_text,
+        ]
+      properties:
+        id:
+          type: string
+          format: uuid
+        created_at_rfc3339:
+          type: string
+          format: date-time
+        expires_at_rfc3339:
+          type: string
+          format: date-time
+        prompt:
+          type: string
+        base_policy_hash_hex:
+          type: string
+        proposed_policy_hash_hex:
+          type: string
+        diff:
+          type: array
+          items:
+            $ref: "#/components/schemas/PolicyDiffLine"
+        proposed_policy_text:
+          type: string
+
+    PolicyCompileResponse:
+      type: object
+      required: [proposal]
+      properties:
+        proposal:
+          $ref: "#/components/schemas/PolicyProposal"
+
+    PolicyApplyResponse:
+      oneOf:
+        - type: object
+          required: [status, policy_hash_hex, updated_at_rfc3339]
+          properties:
+            status:
+              type: string
+              const: applied
+            policy_hash_hex:
+              type: string
+            updated_at_rfc3339:
+              type: string
+              format: date-time
+        - type: object
+          required: [status, approval]
+          properties:
+            status:
+              type: string
+              const: approval_required
+            approval:
+              $ref: "#/components/schemas/ApprovalRequest"
+        - type: object
+          required: [status, reason]
+          properties:
+            status:
+              type: string
+              const: denied
+            reason:
+              type: string
+        - type: object
+          required: [status, message]
+          properties:
+            status:
+              type: string
+              const: error
+            message:
+              type: string
+
     ToolCategory:
       description: |
         Matches `briefcase_core::ToolCategory`.
@@ -1020,6 +1133,85 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/policy:
+    get:
+      summary: Get current Cedar policy text
+      operationId: policyGet
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PolicyGetResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/policy/compile:
+    post:
+      summary: Compile a natural-language policy prompt into a Cedar policy proposal
+      operationId: policyCompile
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PolicyCompileRequest"
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PolicyCompileResponse"
+        "400":
+          description: bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/policy/proposals/{id}/apply:
+    post:
+      summary: Apply a previously-compiled policy proposal (requires user approval)
+      operationId: policyApply
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PolicyApplyResponse"
         "401":
           description: unauthorized
           content:

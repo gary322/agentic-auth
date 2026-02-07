@@ -169,6 +169,16 @@ async fn handle(client: &BriefcaseClient, req: NativeRequest) -> anyhow::Result<
     }
 
     #[derive(Debug, Deserialize)]
+    struct PolicyCompileParams {
+        prompt: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct PolicyApplyParams {
+        proposal_id: String,
+    }
+
+    #[derive(Debug, Deserialize)]
     struct ApproveParams {
         id: String,
     }
@@ -287,6 +297,23 @@ async fn handle(client: &BriefcaseClient, req: NativeRequest) -> anyhow::Result<
                     .set_budget(&p.category, p.daily_limit_microusd)
                     .await?
             ))
+        }
+        "policy_get" => Ok(ok_json!(client.policy_get().await?)),
+        "policy_compile" => {
+            let p: PolicyCompileParams =
+                serde_json::from_value(req.params).context("parse params")?;
+            Ok(ok_json!(
+                client
+                    .policy_compile(briefcase_api::types::PolicyCompileRequest { prompt: p.prompt })
+                    .await?
+            ))
+        }
+        "policy_apply" => {
+            let p: PolicyApplyParams =
+                serde_json::from_value(req.params).context("parse params")?;
+            let proposal_id =
+                uuid::Uuid::parse_str(&p.proposal_id).context("invalid proposal id")?;
+            Ok(ok_json!(client.policy_apply(&proposal_id).await?))
         }
         "list_approvals" => Ok(ok_json!(client.list_approvals().await?)),
         "approve" => {

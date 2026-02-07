@@ -18,6 +18,10 @@ describe("briefcased OpenAPI types", () => {
       "/v1/providers/{id}/oauth/revoke" extends keyof paths ? true : false;
     type HasSignerPairStart =
       "/v1/signer/pair/start" extends keyof paths ? true : false;
+    type HasPolicy = "/v1/policy" extends keyof paths ? true : false;
+    type HasPolicyCompile = "/v1/policy/compile" extends keyof paths ? true : false;
+    type HasPolicyApply =
+      "/v1/policy/proposals/{id}/apply" extends keyof paths ? true : false;
 
     const hasTools: HasTools = true;
     const hasCallTool: HasCallTool = true;
@@ -28,6 +32,9 @@ describe("briefcased OpenAPI types", () => {
     const hasMcpOauthRevoke: HasMcpOauthRevoke = true;
     const hasProviderOauthRevoke: HasProviderOauthRevoke = true;
     const hasSignerPairStart: HasSignerPairStart = true;
+    const hasPolicy: HasPolicy = true;
+    const hasPolicyCompile: HasPolicyCompile = true;
+    const hasPolicyApply: HasPolicyApply = true;
 
     // Runtime assertions are intentionally trivial; this test mainly ensures type generation stays in sync.
     expect(
@@ -39,7 +46,10 @@ describe("briefcased OpenAPI types", () => {
         hasMcpOauthExchange &&
         hasMcpOauthRevoke &&
         hasProviderOauthRevoke &&
-        hasSignerPairStart,
+        hasSignerPairStart &&
+        hasPolicy &&
+        hasPolicyCompile &&
+        hasPolicyApply,
     ).toBe(true);
   });
 });
