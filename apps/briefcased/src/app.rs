@@ -3520,8 +3520,10 @@ mod tests {
                     })),
                 ),
                 "refresh_token" => {
-                    if !matches!(body.refresh_token.as_deref(), Some("rt_mock") | Some("rt_mock2"))
-                    {
+                    if !matches!(
+                        body.refresh_token.as_deref(),
+                        Some("rt_mock") | Some("rt_mock2")
+                    ) {
                         return (
                             StatusCode::BAD_REQUEST,
                             Json(serde_json::json!({"error":"invalid_grant"})),

@@ -258,7 +258,7 @@ For each task, include:
   - **Done when**: revoked VCs are rejected and logged/receipted.
   - **Verify**: unit + integration tests.
 
-- [ ] 9.3 Capability revocation profile
+- [x] 9.3 Capability revocation profile
   - **Do**: update provider gateway to support `jti` denylist; add revoke endpoint; daemon handles revocation signals.
   - **Files**: `apps/agent-access-gateway/src/main.rs`, `apps/briefcased/src/provider.rs`
   - **Done when**: revoked capabilities cannot be used; daemon refreshes appropriately.

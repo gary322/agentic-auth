@@ -17,6 +17,8 @@ use crate::db::Db;
 use briefcase_secrets::SecretStore;
 
 const OAUTH_CLIENT_ID: &str = "briefcase-cli";
+const HEADER_BRIEFCASE_ERROR: &str = "x-briefcase-error";
+const BRIEFCASE_ERROR_CAPABILITY_REVOKED: &str = "capability_revoked";
 
 #[derive(Clone)]
 pub struct ProviderClient {
@@ -93,77 +95,58 @@ impl ProviderClient {
             .await?
             .context("unknown provider_id")?;
 
-        let tok = self.get_or_refresh_token(provider_id, &base_url).await?;
-
-        let resp = self
-            .quote_request(&base_url, symbol, &tok.token)
-            .await
-            .context("provider quote request")?;
-
-        if resp.status() == StatusCode::UNAUTHORIZED {
-            warn!(provider_id, "provider rejected cached token; refreshing");
-            self.cached.lock().await.remove(provider_id);
+        // Retry once on transient auth failures, including explicit capability revocation.
+        for attempt in 0..2 {
             let tok = self.get_or_refresh_token(provider_id, &base_url).await?;
-            return self
-                .get_quote_with_token(
-                    provider_id,
-                    &base_url,
-                    symbol,
-                    &tok.token,
-                    tok.minted_via.clone(),
-                )
-                .await;
+            let resp = self
+                .quote_request(&base_url, symbol, &tok.token)
+                .await
+                .context("provider quote request")?;
+
+            let status = resp.status();
+            if status.is_success() {
+                let cost_usd = resp
+                    .headers()
+                    .get("x-cost-microusd")
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .map(|micros| micros as f64 / 1_000_000.0);
+
+                let json = resp.json::<serde_json::Value>().await?;
+                self.decrement_calls(provider_id).await;
+                return Ok((
+                    json,
+                    tok.minted_via,
+                    cost_usd,
+                    format!("provider:{provider_id}"),
+                ));
+            }
+
+            let should_retry = match status {
+                StatusCode::UNAUTHORIZED | StatusCode::TOO_MANY_REQUESTS => true,
+                StatusCode::FORBIDDEN => resp
+                    .headers()
+                    .get(HEADER_BRIEFCASE_ERROR)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v.eq_ignore_ascii_case(BRIEFCASE_ERROR_CAPABILITY_REVOKED))
+                    .unwrap_or(false),
+                _ => false,
+            };
+
+            if should_retry && attempt == 0 {
+                warn!(provider_id, status = %status, "provider rejected capability; refreshing");
+                self.cached.lock().await.remove(provider_id);
+                continue;
+            }
+
+            anyhow::bail!("provider quote request failed: {}", status);
         }
 
-        let cost_usd = resp
-            .headers()
-            .get("x-cost-microusd")
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.parse::<i64>().ok())
-            .map(|micros| micros as f64 / 1_000_000.0);
-
-        let json = resp.json::<serde_json::Value>().await?;
-        self.decrement_calls(provider_id).await;
-        Ok((
-            json,
-            tok.minted_via,
-            cost_usd,
-            format!("provider:{provider_id}"),
-        ))
+        anyhow::bail!("provider quote request failed after refresh")
     }
 
     pub async fn forget_cached_token(&self, provider_id: &str) {
         self.cached.lock().await.remove(provider_id);
-    }
-
-    async fn get_quote_with_token(
-        &self,
-        provider_id: &str,
-        base_url: &str,
-        symbol: &str,
-        token: &str,
-        minted_via: AuthMethod,
-    ) -> anyhow::Result<(serde_json::Value, AuthMethod, Option<f64>, String)> {
-        let resp = self
-            .quote_request(base_url, symbol, token)
-            .await
-            .context("provider quote request (retry)")?;
-
-        let cost_usd = resp
-            .headers()
-            .get("x-cost-microusd")
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.parse::<i64>().ok())
-            .map(|micros| micros as f64 / 1_000_000.0);
-
-        let json = resp.json::<serde_json::Value>().await?;
-        self.decrement_calls(provider_id).await;
-        Ok((
-            json,
-            minted_via,
-            cost_usd,
-            format!("provider:{provider_id}"),
-        ))
     }
 
     async fn quote_request(
@@ -475,12 +458,15 @@ fn parse_token_response(
 mod tests {
     use super::*;
 
+    use std::collections::HashSet;
     use std::sync::Arc;
 
+    use axum::extract::Query as AxumQuery;
     use axum::extract::State as AxumState;
     use axum::http::{HeaderMap, HeaderValue, StatusCode as AxumStatusCode, Uri};
     use axum::response::IntoResponse as _;
-    use axum::routing::post;
+    use axum::response::Response;
+    use axum::routing::{get, post};
     use axum::{Json, Router};
     use chrono::Utc;
     #[cfg(any(feature = "l402-lnd", all(feature = "l402-cln", unix)))]
@@ -622,6 +608,147 @@ mod tests {
             resp.headers_mut().insert(x402::HEADER_PAYMENT_REQUIRED, hv);
         }
         resp
+    }
+
+    #[derive(Clone)]
+    struct RevocationProviderState {
+        issued: Arc<tokio::sync::Mutex<i64>>,
+        revoked: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct RevocationQuoteQuery {
+        symbol: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    struct RevokeTokenRequest {
+        token: String,
+    }
+
+    fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
+        let h = headers.get("authorization")?.to_str().ok()?;
+        h.strip_prefix("Bearer ")
+    }
+
+    async fn token_revocation(AxumState(st): AxumState<RevocationProviderState>) -> Response {
+        let token = {
+            let mut guard = st.issued.lock().await;
+            *guard += 1;
+            format!("cap{guard}")
+        };
+
+        let tr = serde_json::json!({
+            "token": token,
+            "expires_at_rfc3339": (Utc::now() + chrono::Duration::minutes(10)).to_rfc3339(),
+            "max_calls": 50
+        });
+        (AxumStatusCode::OK, Json(tr)).into_response()
+    }
+
+    async fn revoke_token(
+        AxumState(st): AxumState<RevocationProviderState>,
+        Json(req): Json<RevokeTokenRequest>,
+    ) -> Response {
+        st.revoked.lock().await.insert(req.token);
+        (
+            AxumStatusCode::OK,
+            Json(serde_json::json!({"revoked": true})),
+        )
+            .into_response()
+    }
+
+    async fn quote_revocation(
+        AxumState(st): AxumState<RevocationProviderState>,
+        AxumQuery(q): AxumQuery<RevocationQuoteQuery>,
+        headers: HeaderMap,
+    ) -> Response {
+        let tok = match extract_bearer(&headers) {
+            Some(v) if !v.is_empty() => v,
+            _ => {
+                return (
+                    AxumStatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error":"missing_token"})),
+                )
+                    .into_response();
+            }
+        };
+
+        if st.revoked.lock().await.contains(tok) {
+            let mut resp = (
+                AxumStatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": BRIEFCASE_ERROR_CAPABILITY_REVOKED})),
+            )
+                .into_response();
+            resp.headers_mut().insert(
+                HEADER_BRIEFCASE_ERROR,
+                HeaderValue::from_static(BRIEFCASE_ERROR_CAPABILITY_REVOKED),
+            );
+            return resp;
+        }
+
+        let mut out_headers = HeaderMap::new();
+        out_headers.insert("x-cost-microusd", HeaderValue::from_static("2000"));
+        (
+            out_headers,
+            Json(serde_json::json!({
+                "symbol": q.symbol.to_uppercase(),
+                "price": 123.45,
+                "ts": Utc::now().to_rfc3339(),
+            })),
+        )
+            .into_response()
+    }
+
+    #[tokio::test]
+    async fn capability_revocation_refreshes_token() -> anyhow::Result<()> {
+        let st = RevocationProviderState {
+            issued: Arc::new(tokio::sync::Mutex::new(0)),
+            revoked: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+        };
+        let app = Router::new()
+            .route("/token", post(token_revocation))
+            .route("/api/revoke", post(revoke_token))
+            .route("/api/quote", get(quote_revocation))
+            .with_state(st.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base_url = format!("http://{addr}");
+
+        let dir = tempdir()?;
+        let db_path = dir.path().join("briefcase.sqlite");
+        let db = Db::open(&db_path).await?;
+        db.init().await?;
+        db.upsert_provider("demo", &base_url).await?;
+
+        let secrets = Arc::new(briefcase_secrets::InMemorySecretStore::default());
+        let payments = Arc::new(briefcase_payments::HttpDemoPaymentBackend::new()?);
+        let client = ProviderClient::new(secrets, db, None, payments);
+
+        let args = serde_json::json!({"symbol":"TEST","provider_id":"demo"});
+        let (_json, minted_via, _cost, _prov) = client.get_quote(&args).await?;
+        assert!(matches!(minted_via, AuthMethod::CapabilityToken));
+        assert_eq!(*st.issued.lock().await, 1);
+
+        // Revoke the first issued capability. Subsequent calls should refresh and succeed.
+        reqwest::Client::new()
+            .post(format!("{base_url}/api/revoke"))
+            .json(&serde_json::json!({"token":"cap1"}))
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let (_json, minted_via, _cost, _prov) = client.get_quote(&args).await?;
+        assert!(matches!(minted_via, AuthMethod::CapabilityToken));
+        assert_eq!(*st.issued.lock().await, 2);
+
+        handle.abort();
+        Ok(())
     }
 
     #[tokio::test]

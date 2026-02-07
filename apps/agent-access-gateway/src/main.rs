@@ -27,6 +27,10 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
+const HEADER_BRIEFCASE_ERROR: &str = "x-briefcase-error";
+const BRIEFCASE_ERROR_CAPABILITY_REVOKED: &str = "capability_revoked";
+const HEADER_AAG_ADMIN_SECRET: &str = "x-aag-admin-secret";
+
 // x402 v2 offer defaults for the reference provider gateway.
 const X402_V2_NETWORK: &str = "eip155:84532"; // Base Sepolia
 const X402_V2_ASSET: &str = "0x036CbD53842c5426634e7929541eC2318f3dCF7e"; // USDC (Base Sepolia)
@@ -112,6 +116,7 @@ struct AppState {
     pending_x402: Arc<Mutex<HashMap<String, PendingPayment>>>,
     pending_l402: Arc<Mutex<HashMap<String, PendingL402>>>,
     usage: Arc<Mutex<HashMap<String, i64>>>, // jti -> calls
+    revoked_cap_jtis: Arc<Mutex<HashMap<String, i64>>>, // jti -> revoked_at (unix seconds)
     used_dpop_jtis: Arc<Mutex<HashMap<String, i64>>>, // `${jkt}:${jti}` -> iat
     used_x402_nonces: Arc<Mutex<HashMap<String, i64>>>, // nonce -> iat
     oauth_codes: Arc<Mutex<HashMap<String, OAuthCode>>>, // code -> record
@@ -240,6 +245,22 @@ struct CapabilityCnf {
 #[derive(Debug, Deserialize)]
 struct QuoteQuery {
     symbol: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct RevokeRequest {
+    /// Capability `jti` to revoke.
+    jti: Option<String>,
+    /// Capability token to revoke (decoded to extract `jti`).
+    token: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct RevokeResponse {
+    revoked: bool,
+    jti: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -380,6 +401,7 @@ async fn main() -> anyhow::Result<()> {
         pending_x402: Arc::new(Mutex::new(HashMap::new())),
         pending_l402: Arc::new(Mutex::new(HashMap::new())),
         usage: Arc::new(Mutex::new(HashMap::new())),
+        revoked_cap_jtis: Arc::new(Mutex::new(HashMap::new())),
         used_dpop_jtis: Arc::new(Mutex::new(HashMap::new())),
         used_x402_nonces: Arc::new(Mutex::new(HashMap::new())),
         oauth_codes: Arc::new(Mutex::new(HashMap::new())),
@@ -395,6 +417,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/oauth/authorize", get(oauth_authorize))
         .route("/oauth/token", post(oauth_token))
         .route("/vc/issue", post(vc_issue))
+        .route("/api/revoke", post(revoke))
         .route("/api/quote", get(quote))
         .layer(TraceLayer::new_for_http())
         .with_state(st);
@@ -582,6 +605,14 @@ fn prune_used_x402_nonces(used: &mut HashMap<String, i64>) {
     // x402 authorizations are short-lived; keep a bounded replay cache.
     let cutoff = now - (60 * 60);
     used.retain(|_, iat| *iat >= cutoff);
+}
+
+fn prune_revoked_capabilities(revoked: &mut HashMap<String, i64>) {
+    let now = Utc::now().timestamp();
+    // Keep revocations for a bounded window: capabilities expire quickly (10 minutes), but we
+    // retain revocations longer to be robust to clock skew and retries.
+    let cutoff = now - (60 * 60);
+    revoked.retain(|_, ts| *ts >= cutoff);
 }
 
 fn prune_pending_l402(pending: &mut HashMap<String, PendingL402>) {
@@ -1095,17 +1126,122 @@ async fn l402_pay(
     }))
 }
 
+async fn revoke(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<RevokeRequest>,
+) -> Response {
+    // This endpoint is intended for provider-side admin usage (e.g. incident response).
+    // Keep it simple: require the provider's shared secret, and only store the jti.
+    let admin = match headers
+        .get(HEADER_AAG_ADMIN_SECRET)
+        .and_then(|h| h.to_str().ok())
+    {
+        Some(v) => v,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error":"missing_admin_secret"})),
+            )
+                .into_response();
+        }
+    };
+    if admin.as_bytes() != st.secret.as_slice() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error":"invalid_admin_secret"})),
+        )
+            .into_response();
+    }
+
+    let jti = if let Some(jti) = req.jti.as_deref() {
+        if jti.is_empty() || jti.len() > 128 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"invalid_jti"})),
+            )
+                .into_response();
+        }
+        jti.to_string()
+    } else if let Some(token) = req.token.as_deref() {
+        match decode_capability(&st, token) {
+            Ok(claims) => claims.jti,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":"invalid_capability_token"})),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"missing_jti_or_token"})),
+        )
+            .into_response();
+    };
+
+    let now = Utc::now().timestamp();
+    {
+        let mut guard = st.revoked_cap_jtis.lock().await;
+        prune_revoked_capabilities(&mut guard);
+        guard.insert(jti.clone(), now);
+    }
+
+    (StatusCode::OK, Json(RevokeResponse { revoked: true, jti })).into_response()
+}
+
 async fn quote(
     State(st): State<AppState>,
     uri: Uri,
     Query(q): Query<QuoteQuery>,
     headers: HeaderMap,
-) -> Result<(HeaderMap, Json<serde_json::Value>), StatusCode> {
-    let token = extract_access_token(&headers).ok_or(StatusCode::UNAUTHORIZED)?;
-    let claims = decode_capability(&st, token).map_err(|_| StatusCode::UNAUTHORIZED)?;
+) -> Response {
+    let token = match extract_access_token(&headers) {
+        Some(v) => v,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error":"missing_token"})),
+            )
+                .into_response();
+        }
+    };
+    let claims = match decode_capability(&st, token) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error":"invalid_token"})),
+            )
+                .into_response();
+        }
+    };
 
     if claims.scope != "quote" {
-        return Err(StatusCode::FORBIDDEN);
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error":"insufficient_scope"})),
+        )
+            .into_response();
+    }
+
+    {
+        let mut guard = st.revoked_cap_jtis.lock().await;
+        prune_revoked_capabilities(&mut guard);
+        if guard.contains_key(&claims.jti) {
+            let mut resp = (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": BRIEFCASE_ERROR_CAPABILITY_REVOKED})),
+            )
+                .into_response();
+            resp.headers_mut().insert(
+                HEADER_BRIEFCASE_ERROR,
+                HeaderValue::from_static(BRIEFCASE_ERROR_CAPABILITY_REVOKED),
+            );
+            return resp;
+        }
     }
 
     // If the capability is DPoP-bound, require a valid DPoP proof for every request.
@@ -1113,12 +1249,31 @@ async fn quote(
         let dpop = headers
             .get("dpop")
             .and_then(|h| h.to_str().ok())
-            .ok_or(StatusCode::UNAUTHORIZED)?;
-        let expected_url = expected_request_url(&headers, &uri)?;
+            .ok_or_else(|| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error":"missing_dpop"})),
+                )
+            });
+        let dpop = match dpop {
+            Ok(v) => v,
+            Err(resp) => return resp.into_response(),
+        };
+
+        let expected_url = match expected_request_url(&headers, &uri) {
+            Ok(v) => v,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":"invalid_request_url"})),
+                )
+                    .into_response();
+            }
+        };
 
         let mut used = st.used_dpop_jtis.lock().await;
         prune_used_dpop_jtis(&mut used);
-        verify_dpop_jwt(
+        if verify_dpop_jwt(
             dpop,
             "GET",
             &expected_url,
@@ -1126,13 +1281,24 @@ async fn quote(
             Some(&cnf.jkt),
             &mut used,
         )
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        .is_err()
+        {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error":"invalid_dpop"})),
+            )
+                .into_response();
+        }
     }
 
     let mut usage = st.usage.lock().await;
     let used = usage.entry(claims.jti.clone()).or_insert(0);
     if *used >= claims.max_calls {
-        return Err(StatusCode::TOO_MANY_REQUESTS);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error":"max_calls_exceeded"})),
+        )
+            .into_response();
     }
     *used += 1;
 
@@ -1146,14 +1312,15 @@ async fn quote(
         st.cost_microusd.to_string().parse().unwrap(),
     );
 
-    Ok((
+    (
         out_headers,
         Json(serde_json::json!({
             "symbol": q.symbol.to_uppercase(),
             "price": price,
             "ts": ts
         })),
-    ))
+    )
+        .into_response()
 }
 
 async fn issue_token_after_x402(
@@ -1572,6 +1739,7 @@ mod tests {
             pending_x402: Arc::new(Mutex::new(HashMap::new())),
             pending_l402: Arc::new(Mutex::new(HashMap::new())),
             usage: Arc::new(Mutex::new(HashMap::new())),
+            revoked_cap_jtis: Arc::new(Mutex::new(HashMap::new())),
             used_dpop_jtis: Arc::new(Mutex::new(HashMap::new())),
             used_x402_nonces: Arc::new(Mutex::new(HashMap::new())),
             oauth_codes: Arc::new(Mutex::new(HashMap::new())),
@@ -1587,6 +1755,7 @@ mod tests {
             .route("/oauth/authorize", get(oauth_authorize))
             .route("/oauth/token", post(oauth_token))
             .route("/vc/issue", post(vc_issue))
+            .route("/api/revoke", post(revoke))
             .route("/api/quote", get(quote))
             .with_state(st);
 
@@ -1771,6 +1940,104 @@ mod tests {
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn capability_jti_revoke_denies_token() -> anyhow::Result<()> {
+        let (base_url, handle) = start_test_server().await?;
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+
+        // Deterministic Ed25519 key.
+        let seed = [7u8; 32];
+        let sk = SigningKey::from_bytes(&seed);
+        let token_url = Url::parse(&format!("{base_url}/token"))?;
+
+        // Request a token: expect a 402 challenge.
+        let resp = http
+            .post(token_url.as_str())
+            .header("DPoP", dpop_proof_eddsa(&sk, &token_url, "POST", None))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let ch = resp.json::<PaymentChallenge>().await?;
+        let PaymentChallenge::X402 {
+            payment_id,
+            payment_url,
+            ..
+        } = ch
+        else {
+            anyhow::bail!("expected x402 challenge");
+        };
+
+        // Pay.
+        let pay_url = if payment_url.starts_with("http") {
+            payment_url
+        } else {
+            format!("{base_url}{payment_url}")
+        };
+        let proof = http
+            .post(pay_url)
+            .json(&PayRequest { payment_id })
+            .send()
+            .await?
+            .json::<PayResponse>()
+            .await?
+            .proof;
+
+        // Token after payment.
+        let cap = http
+            .post(token_url.as_str())
+            .header("DPoP", dpop_proof_eddsa(&sk, &token_url, "POST", None))
+            .header(reqwest::header::AUTHORIZATION, format!("X402 {proof}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<TokenResponse>()
+            .await?
+            .token;
+
+        let mut validation = Validation::default();
+        validation.validate_aud = false;
+        let claims = jsonwebtoken::decode::<CapabilityClaims>(
+            &cap,
+            &DecodingKey::from_secret(b"test-secret"),
+            &validation,
+        )?
+        .claims;
+
+        // Revoke jti.
+        let revoke_url = format!("{base_url}/api/revoke");
+        let resp = http
+            .post(revoke_url)
+            .header(HEADER_AAG_ADMIN_SECRET, "test-secret")
+            .json(&serde_json::json!({ "jti": claims.jti }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Quote should now be rejected with a revocation signal.
+        let quote_url = Url::parse(&format!("{base_url}/api/quote?symbol=TEST"))?;
+        let iat = Utc::now().timestamp();
+        let dpop = dpop_proof_eddsa_with(&sk, &quote_url, "GET", Some(&cap), iat, "revoked_test");
+
+        let resp = http
+            .get(quote_url.as_str())
+            .header(reqwest::header::AUTHORIZATION, format!("DPoP {cap}"))
+            .header("DPoP", &dpop)
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            resp.headers()
+                .get(HEADER_BRIEFCASE_ERROR)
+                .and_then(|h| h.to_str().ok()),
+            Some(BRIEFCASE_ERROR_CAPABILITY_REVOKED)
+        );
 
         handle.abort();
         Ok(())
