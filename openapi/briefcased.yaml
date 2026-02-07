@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Credential Briefcase Daemon API
-  version: 0.1.5
+  version: 0.1.6
   description: |
     Local admin API for `briefcased`.
 
