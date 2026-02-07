@@ -32,6 +32,14 @@ pub struct DeleteProviderResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokeProviderOAuthResponse {
+    pub provider_id: String,
+    pub had_refresh_token: bool,
+    pub remote_revocation_attempted: bool,
+    pub remote_revocation_succeeded: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerSummary {
     pub id: String,
     pub endpoint_url: String,
@@ -51,6 +59,14 @@ pub struct UpsertMcpServerRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteMcpServerResponse {
     pub server_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokeMcpOAuthResponse {
+    pub server_id: String,
+    pub had_refresh_token: bool,
+    pub remote_revocation_attempted: bool,
+    pub remote_revocation_succeeded: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

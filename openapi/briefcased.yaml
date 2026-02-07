@@ -84,6 +84,25 @@ components:
         provider_id:
           type: string
 
+    RevokeProviderOAuthResponse:
+      type: object
+      required:
+        [
+          provider_id,
+          had_refresh_token,
+          remote_revocation_attempted,
+          remote_revocation_succeeded,
+        ]
+      properties:
+        provider_id:
+          type: string
+        had_refresh_token:
+          type: boolean
+        remote_revocation_attempted:
+          type: boolean
+        remote_revocation_succeeded:
+          type: boolean
+
     McpServerSummary:
       type: object
       required: [id, endpoint_url, has_oauth_refresh]
@@ -117,6 +136,25 @@ components:
       properties:
         server_id:
           type: string
+
+    RevokeMcpOAuthResponse:
+      type: object
+      required:
+        [
+          server_id,
+          had_refresh_token,
+          remote_revocation_attempted,
+          remote_revocation_succeeded,
+        ]
+      properties:
+        server_id:
+          type: string
+        had_refresh_token:
+          type: boolean
+        remote_revocation_attempted:
+          type: boolean
+        remote_revocation_succeeded:
+          type: boolean
 
     McpOAuthStartRequest:
       type: object
@@ -643,6 +681,38 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /v1/providers/{id}/oauth/revoke:
+    post:
+      summary: Revoke/disconnect OAuth refresh token for a provider (best-effort RFC 7009)
+      operationId: revokeProviderOauth
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RevokeProviderOAuthResponse"
+        "400":
+          description: bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /v1/mcp/servers:
     get:
       summary: List remote MCP servers
@@ -790,6 +860,38 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/McpOAuthExchangeResponse"
+        "400":
+          description: bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/mcp/servers/{id}/oauth/revoke:
+    post:
+      summary: Revoke/disconnect OAuth refresh token for a remote MCP server (best-effort RFC 7009)
+      operationId: revokeMcpOauth
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RevokeMcpOAuthResponse"
         "400":
           description: bad request
           content:

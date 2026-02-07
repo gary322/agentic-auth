@@ -111,6 +111,10 @@ enum ProvidersCommand {
         #[arg(long, default_value = "briefcase-cli")]
         client_id: String,
     },
+    OauthRevoke {
+        #[arg(long, default_value = "demo")]
+        id: String,
+    },
     VcFetch {
         #[arg(long, default_value = "demo")]
         id: String,
@@ -141,6 +145,9 @@ enum McpServersCommand {
         client_id: String,
         #[arg(long)]
         scope: Option<String>,
+    },
+    OauthRevoke {
+        id: String,
     },
 }
 
@@ -260,6 +267,16 @@ async fn handle_providers(client: &BriefcaseClient, cmd: ProvidersCommand) -> an
             oauth_login(client, &id, &client_id).await?;
             println!("oauth_login: ok provider={id}");
         }
+        ProvidersCommand::OauthRevoke { id } => {
+            let r = client.revoke_provider_oauth(&id).await?;
+            println!(
+                "provider_oauth_revoke: provider={} had_refresh_token={} remote_attempted={} remote_ok={}",
+                r.provider_id,
+                r.had_refresh_token,
+                r.remote_revocation_attempted,
+                r.remote_revocation_succeeded
+            );
+        }
         ProvidersCommand::VcFetch { id } => {
             let r = client.fetch_vc(&id).await?;
             println!(
@@ -298,6 +315,16 @@ async fn handle_mcp(client: &BriefcaseClient, cmd: McpCommand) -> anyhow::Result
             } => {
                 mcp_oauth_login(client, &id, &client_id, scope.as_deref()).await?;
                 println!("mcp_oauth_login: ok server={id}");
+            }
+            McpServersCommand::OauthRevoke { id } => {
+                let r = client.revoke_mcp_oauth(&id).await?;
+                println!(
+                    "mcp_oauth_revoke: server={} had_refresh_token={} remote_attempted={} remote_ok={}",
+                    r.server_id,
+                    r.had_refresh_token,
+                    r.remote_revocation_attempted,
+                    r.remote_revocation_succeeded
+                );
             }
         },
     }

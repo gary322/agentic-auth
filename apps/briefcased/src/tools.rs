@@ -22,9 +22,8 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    pub fn new(provider: ProviderClient, db: Db) -> Self {
+    pub fn new(provider: Arc<ProviderClient>, db: Db) -> Self {
         let mut tools = HashMap::new();
-        let provider = Arc::new(provider);
         let quote_sandbox = Arc::new(
             WasmSandbox::new(include_bytes!(concat!(
                 env!("OUT_DIR"),

@@ -165,6 +165,21 @@ async function loadServersFrom(servers: McpServerSummary[]): Promise<void> {
       }
     });
 
+    const disconnect = document.createElement("button");
+    disconnect.className = "refresh";
+    disconnect.type = "button";
+    disconnect.innerText = "Disconnect OAuth";
+    disconnect.addEventListener("click", async () => {
+      setStatus(`Disconnecting OAuth for ${s.id}...`);
+      try {
+        await rpc("revoke_mcp_oauth", { server_id: s.id });
+        await renderAfter(loadServers);
+        setStatus("OAuth disconnected.");
+      } catch (e) {
+        setStatus(errorMessage(e));
+      }
+    });
+
     const del = document.createElement("button");
     del.className = "refresh";
     del.type = "button";
@@ -180,7 +195,11 @@ async function loadServersFrom(servers: McpServerSummary[]): Promise<void> {
       }
     });
 
-    actions.appendChild(connect);
+    if (s.has_oauth_refresh) {
+      actions.appendChild(disconnect);
+    } else {
+      actions.appendChild(connect);
+    }
     actions.appendChild(del);
     box.appendChild(actions);
     root.appendChild(box);
@@ -236,6 +255,22 @@ async function loadProviders(): Promise<void> {
       }
     });
 
+    const disconnect = document.createElement("button");
+    disconnect.className = "refresh";
+    disconnect.type = "button";
+    disconnect.innerText = "Disconnect OAuth";
+    disconnect.disabled = !p.has_oauth_refresh;
+    disconnect.addEventListener("click", async () => {
+      setStatus(`Disconnecting OAuth for ${p.id}...`);
+      try {
+        await rpc("revoke_provider_oauth", { provider_id: p.id });
+        await renderAfter(loadProviders);
+        setStatus("OAuth disconnected.");
+      } catch (e) {
+        setStatus(errorMessage(e));
+      }
+    });
+
     const del = document.createElement("button");
     del.className = "refresh";
     del.type = "button";
@@ -252,6 +287,7 @@ async function loadProviders(): Promise<void> {
     });
 
     actions.appendChild(fetchVc);
+    actions.appendChild(disconnect);
     actions.appendChild(del);
     box.appendChild(actions);
 

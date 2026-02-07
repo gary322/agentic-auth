@@ -19,9 +19,9 @@ use crate::types::{
     ListApprovalsResponse, ListBudgetsResponse, ListMcpServersResponse, ListProvidersResponse,
     ListReceiptsResponse, ListToolsResponse, McpOAuthExchangeRequest, McpOAuthExchangeResponse,
     McpOAuthStartRequest, McpOAuthStartResponse, McpServerSummary, OAuthExchangeRequest,
-    OAuthExchangeResponse, ProviderSummary, SetBudgetRequest, SignerPairCompleteRequest,
-    SignerPairCompleteResponse, SignerPairStartResponse, UpsertMcpServerRequest,
-    UpsertProviderRequest, VerifyReceiptsResponse,
+    OAuthExchangeResponse, ProviderSummary, RevokeMcpOAuthResponse, RevokeProviderOAuthResponse,
+    SetBudgetRequest, SignerPairCompleteRequest, SignerPairCompleteResponse,
+    SignerPairStartResponse, UpsertMcpServerRequest, UpsertProviderRequest, VerifyReceiptsResponse,
 };
 
 #[derive(Debug, Clone)]
@@ -103,6 +103,17 @@ impl BriefcaseClient {
         .await
     }
 
+    pub async fn revoke_provider_oauth(
+        &self,
+        provider_id: &str,
+    ) -> Result<RevokeProviderOAuthResponse, BriefcaseClientError> {
+        self.post_json(
+            &format!("/v1/providers/{provider_id}/oauth/revoke"),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
     pub async fn list_mcp_servers(&self) -> Result<ListMcpServersResponse, BriefcaseClientError> {
         self.get_json("/v1/mcp/servers").await
     }
@@ -125,6 +136,17 @@ impl BriefcaseClient {
     ) -> Result<DeleteMcpServerResponse, BriefcaseClientError> {
         self.post_json(
             &format!("/v1/mcp/servers/{server_id}/delete"),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn revoke_mcp_oauth(
+        &self,
+        server_id: &str,
+    ) -> Result<RevokeMcpOAuthResponse, BriefcaseClientError> {
+        self.post_json(
+            &format!("/v1/mcp/servers/{server_id}/oauth/revoke"),
             serde_json::json!({}),
         )
         .await

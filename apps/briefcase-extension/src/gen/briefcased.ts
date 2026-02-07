@@ -30,6 +30,10 @@ export interface paths {
     /** Delete provider */
     post: operations["deleteProvider"];
   };
+  "/v1/providers/{id}/oauth/revoke": {
+    /** Revoke/disconnect OAuth refresh token for a provider (best-effort RFC 7009) */
+    post: operations["revokeProviderOauth"];
+  };
   "/v1/mcp/servers": {
     /** List remote MCP servers */
     get: operations["listMcpServers"];
@@ -49,6 +53,10 @@ export interface paths {
   "/v1/mcp/servers/{id}/oauth/exchange": {
     /** Exchange OAuth authorization code for a refresh token (stored in daemon) */
     post: operations["mcpOauthExchange"];
+  };
+  "/v1/mcp/servers/{id}/oauth/revoke": {
+    /** Revoke/disconnect OAuth refresh token for a remote MCP server (best-effort RFC 7009) */
+    post: operations["revokeMcpOauth"];
   };
   "/v1/providers/{id}/oauth/exchange": {
     /** Exchange OAuth authorization code for refresh token (stored in daemon) */
@@ -140,6 +148,12 @@ export interface components {
     DeleteProviderResponse: {
       provider_id: string;
     };
+    RevokeProviderOAuthResponse: {
+      provider_id: string;
+      had_refresh_token: boolean;
+      remote_revocation_attempted: boolean;
+      remote_revocation_succeeded: boolean;
+    };
     McpServerSummary: {
       id: string;
       endpoint_url: string;
@@ -153,6 +167,12 @@ export interface components {
     };
     DeleteMcpServerResponse: {
       server_id: string;
+    };
+    RevokeMcpOAuthResponse: {
+      server_id: string;
+      had_refresh_token: boolean;
+      remote_revocation_attempted: boolean;
+      remote_revocation_succeeded: boolean;
     };
     McpOAuthStartRequest: {
       client_id: string;
@@ -478,6 +498,34 @@ export interface operations {
       };
     };
   };
+  /** Revoke/disconnect OAuth refresh token for a provider (best-effort RFC 7009) */
+  revokeProviderOauth: {
+    parameters: {
+      path: {
+        id: string;
+      };
+    };
+    responses: {
+      /** @description ok */
+      200: {
+        content: {
+          "application/json": components["schemas"]["RevokeProviderOAuthResponse"];
+        };
+      };
+      /** @description bad request */
+      400: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+      /** @description unauthorized */
+      401: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+    };
+  };
   /** List remote MCP servers */
   listMcpServers: {
     responses: {
@@ -600,6 +648,34 @@ export interface operations {
       200: {
         content: {
           "application/json": components["schemas"]["McpOAuthExchangeResponse"];
+        };
+      };
+      /** @description bad request */
+      400: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+      /** @description unauthorized */
+      401: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+    };
+  };
+  /** Revoke/disconnect OAuth refresh token for a remote MCP server (best-effort RFC 7009) */
+  revokeMcpOauth: {
+    parameters: {
+      path: {
+        id: string;
+      };
+    };
+    responses: {
+      /** @description ok */
+      200: {
+        content: {
+          "application/json": components["schemas"]["RevokeMcpOAuthResponse"];
         };
       };
       /** @description bad request */

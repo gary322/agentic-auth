@@ -28,6 +28,8 @@ pub struct RemoteMcpOauthRecord {
     pub issuer: String,
     pub authorization_endpoint: String,
     pub token_endpoint: String,
+    /// RFC 7009 token revocation endpoint, if advertised by the auth server.
+    pub revocation_endpoint: Option<String>,
     pub resource: String,
     pub dpop_signing_alg_values_supported: Vec<String>,
 }
@@ -145,6 +147,7 @@ impl Db {
                       issuer                TEXT NOT NULL,
                       authorization_endpoint TEXT NOT NULL,
                       token_endpoint        TEXT NOT NULL,
+                      revocation_endpoint   TEXT,
                       resource              TEXT NOT NULL,
                       dpop_algs_json        TEXT NOT NULL DEFAULT '[]',
                       discovered_at_rfc3339 TEXT NOT NULL
@@ -194,6 +197,10 @@ impl Db {
             .call(|conn| {
                 let _ = conn.execute(
                     "ALTER TABLE remote_mcp_oauth ADD COLUMN dpop_algs_json TEXT NOT NULL DEFAULT '[]'",
+                    [],
+                );
+                let _ = conn.execute(
+                    "ALTER TABLE remote_mcp_oauth ADD COLUMN revocation_endpoint TEXT",
                     [],
                 );
                 let _ = conn.execute(
@@ -337,12 +344,14 @@ impl Db {
         Ok(rows)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert_remote_mcp_oauth(
         &self,
         server_id: &str,
         issuer: &str,
         authorization_endpoint: &str,
         token_endpoint: &str,
+        revocation_endpoint: Option<&str>,
         resource: &str,
         dpop_signing_alg_values_supported: &[String],
     ) -> anyhow::Result<()> {
@@ -350,6 +359,7 @@ impl Db {
         let issuer = issuer.to_string();
         let authorization_endpoint = authorization_endpoint.to_string();
         let token_endpoint = token_endpoint.to_string();
+        let revocation_endpoint = revocation_endpoint.map(|s| s.to_string());
         let resource = resource.to_string();
         let dpop_algs_json = serde_json::to_string(dpop_signing_alg_values_supported)
             .context("serialize dpop algs")?;
@@ -358,12 +368,13 @@ impl Db {
             .call(move |conn| {
                 conn.execute(
                     r#"
-                    INSERT INTO remote_mcp_oauth(server_id, issuer, authorization_endpoint, token_endpoint, resource, dpop_algs_json, discovered_at_rfc3339)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    INSERT INTO remote_mcp_oauth(server_id, issuer, authorization_endpoint, token_endpoint, revocation_endpoint, resource, dpop_algs_json, discovered_at_rfc3339)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                     ON CONFLICT(server_id) DO UPDATE SET
                       issuer=excluded.issuer,
                       authorization_endpoint=excluded.authorization_endpoint,
                       token_endpoint=excluded.token_endpoint,
+                      revocation_endpoint=excluded.revocation_endpoint,
                       resource=excluded.resource,
                       dpop_algs_json=excluded.dpop_algs_json,
                       discovered_at_rfc3339=excluded.discovered_at_rfc3339
@@ -373,6 +384,7 @@ impl Db {
                         issuer,
                         authorization_endpoint,
                         token_endpoint,
+                        revocation_endpoint,
                         resource,
                         dpop_algs_json,
                         discovered_at,
@@ -395,13 +407,13 @@ impl Db {
                 Ok(conn
                     .query_row(
                         r#"
-                        SELECT server_id, issuer, authorization_endpoint, token_endpoint, resource, dpop_algs_json
+                        SELECT server_id, issuer, authorization_endpoint, token_endpoint, revocation_endpoint, resource, dpop_algs_json
                         FROM remote_mcp_oauth
                         WHERE server_id=?1
                         "#,
                         params![server_id],
                         |row| {
-                            let dpop_algs_json: String = row.get(5)?;
+                            let dpop_algs_json: String = row.get(6)?;
                             let dpop_signing_alg_values_supported: Vec<String> =
                                 serde_json::from_str(&dpop_algs_json).unwrap_or_default();
                             Ok(RemoteMcpOauthRecord {
@@ -409,7 +421,8 @@ impl Db {
                                 issuer: row.get(1)?,
                                 authorization_endpoint: row.get(2)?,
                                 token_endpoint: row.get(3)?,
-                                resource: row.get(4)?,
+                                revocation_endpoint: row.get(4)?,
+                                resource: row.get(5)?,
                                 dpop_signing_alg_values_supported,
                             })
                         },

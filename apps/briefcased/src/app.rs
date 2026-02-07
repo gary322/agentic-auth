@@ -15,9 +15,10 @@ use briefcase_api::types::{
     ListApprovalsResponse, ListBudgetsResponse, ListMcpServersResponse, ListProvidersResponse,
     ListReceiptsResponse, ListToolsResponse, McpOAuthExchangeRequest, McpOAuthExchangeResponse,
     McpOAuthStartRequest, McpOAuthStartResponse, OAuthExchangeRequest, OAuthExchangeResponse,
-    ProviderSummary, SetBudgetRequest, SignerAlgorithm, SignerPairCompleteRequest,
-    SignerPairCompleteResponse, SignerPairStartResponse, SignerSignedRequest,
-    UpsertMcpServerRequest, UpsertProviderRequest, VerifyReceiptsResponse,
+    ProviderSummary, RevokeMcpOAuthResponse, RevokeProviderOAuthResponse, SetBudgetRequest,
+    SignerAlgorithm, SignerPairCompleteRequest, SignerPairCompleteResponse,
+    SignerPairStartResponse, SignerSignedRequest, UpsertMcpServerRequest, UpsertProviderRequest,
+    VerifyReceiptsResponse,
 };
 use briefcase_core::{
     ApprovalKind, PolicyDecision, ToolCall, ToolEgressPolicy, ToolFilesystemPolicy, ToolLimits,
@@ -54,6 +55,7 @@ pub struct AppState {
     pub receipts: ReceiptStore,
     pub policy: Arc<CedarPolicyEngine>,
     pub risk: Arc<briefcase_risk::RiskEngine>,
+    pub provider: Arc<ProviderClient>,
     pub tools: ToolRegistry,
     pub oauth_discovery: Arc<briefcase_oauth_discovery::OAuthDiscoveryClient>,
     pub remote_mcp: Arc<RemoteMcpManager>,
@@ -222,8 +224,13 @@ impl AppState {
                 None => Arc::new(briefcase_payments::HttpDemoPaymentBackend::new()?),
             };
 
-        let provider = ProviderClient::new(secrets.clone(), db.clone(), pop_signer, payments);
-        let tools = ToolRegistry::new(provider, db.clone());
+        let provider = Arc::new(ProviderClient::new(
+            secrets.clone(),
+            db.clone(),
+            pop_signer,
+            payments,
+        ));
+        let tools = ToolRegistry::new(provider.clone(), db.clone());
 
         let pairing = Arc::new(PairingManager::new(std::time::Duration::from_secs(300)));
         let signer_replay = Arc::new(SignerReplayCache::new(std::time::Duration::from_secs(600)));
@@ -234,6 +241,7 @@ impl AppState {
             receipts,
             policy,
             risk,
+            provider,
             tools,
             oauth_discovery,
             remote_mcp,
@@ -283,6 +291,10 @@ fn router(state: AppState) -> Router {
         .route("/v1/providers", get(list_providers))
         .route("/v1/providers/{id}", post(upsert_provider))
         .route("/v1/providers/{id}/delete", post(delete_provider))
+        .route(
+            "/v1/providers/{id}/oauth/revoke",
+            post(revoke_provider_oauth),
+        )
         .route("/v1/mcp/servers", get(list_mcp_servers))
         .route("/v1/mcp/servers/{id}", post(upsert_mcp_server))
         .route("/v1/mcp/servers/{id}/delete", post(delete_mcp_server))
@@ -291,6 +303,7 @@ fn router(state: AppState) -> Router {
             "/v1/mcp/servers/{id}/oauth/exchange",
             post(exchange_mcp_oauth),
         )
+        .route("/v1/mcp/servers/{id}/oauth/revoke", post(revoke_mcp_oauth))
         .route("/v1/budgets", get(list_budgets))
         .route("/v1/budgets/{category}", post(set_budget))
         .route("/v1/providers/{id}/oauth/exchange", post(oauth_exchange))
@@ -415,6 +428,10 @@ async fn delete_provider(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<DeleteProviderResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if !is_valid_provider_id(&id) {
+        return Err(bad_request("invalid_provider_id"));
+    }
+    state.provider.forget_cached_token(&id).await;
     state.db.delete_vc(&id).await.map_err(internal_error)?;
     state
         .secrets
@@ -427,6 +444,98 @@ async fn delete_provider(
         .await
         .map_err(internal_error)?;
     Ok(Json(DeleteProviderResponse { provider_id: id }))
+}
+
+async fn revoke_provider_oauth(
+    State(state): State<AppState>,
+    AxumPath(provider_id): AxumPath<String>,
+) -> Result<Json<RevokeProviderOAuthResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if !is_valid_provider_id(&provider_id) {
+        return Err(bad_request("invalid_provider_id"));
+    }
+
+    let Some(base_url) = state
+        .db
+        .provider_base_url(&provider_id)
+        .await
+        .map_err(internal_error)?
+    else {
+        return Err(not_found("unknown_provider"));
+    };
+
+    let secret_key = format!("oauth.{provider_id}.refresh_token");
+    let raw = state
+        .secrets
+        .get(&secret_key)
+        .await
+        .map_err(internal_error)?;
+
+    let had_refresh_token = raw.is_some();
+    let mut remote_revocation_attempted = false;
+    let mut remote_revocation_succeeded = false;
+
+    if let Some(raw) = raw
+        && let Ok(refresh_token) = String::from_utf8(raw.into_inner())
+    {
+        // RFC 7009: best-effort. Some providers may not support revocation.
+        let base = url::Url::parse(&base_url).map_err(internal_error)?;
+        let revoke_url = base.join("/oauth/revoke").map_err(internal_error)?;
+
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(internal_error)?;
+
+        remote_revocation_attempted = true;
+        match http
+            .post(revoke_url)
+            .form(&[
+                ("token", refresh_token.as_str()),
+                ("token_type_hint", "refresh_token"),
+                ("client_id", "briefcase-cli"),
+            ])
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                remote_revocation_succeeded = resp.status().is_success();
+            }
+            Err(_) => {
+                remote_revocation_succeeded = false;
+            }
+        }
+    }
+
+    // Always delete local secrets and any in-memory cached capabilities.
+    state
+        .secrets
+        .delete(&secret_key)
+        .await
+        .map_err(internal_error)?;
+    state.provider.forget_cached_token(&provider_id).await;
+
+    // Audit receipt (no raw tokens).
+    state
+        .receipts
+        .append(serde_json::json!({
+            "kind": "oauth_revoke",
+            "target": "provider",
+            "provider_id": provider_id,
+            "had_refresh_token": had_refresh_token,
+            "remote_revocation_attempted": remote_revocation_attempted,
+            "remote_revocation_succeeded": remote_revocation_succeeded,
+            "ts": Utc::now().to_rfc3339(),
+        }))
+        .await
+        .map_err(|e| internal_error(anyhow::anyhow!(e.to_string())))?;
+
+    Ok(Json(RevokeProviderOAuthResponse {
+        provider_id,
+        had_refresh_token,
+        remote_revocation_attempted,
+        remote_revocation_succeeded,
+    }))
 }
 
 async fn list_mcp_servers(State(state): State<AppState>) -> Json<ListMcpServersResponse> {
@@ -484,6 +593,14 @@ async fn delete_mcp_server(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<DeleteMcpServerResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if !is_valid_provider_id(&id) {
+        return Err(bad_request("invalid_mcp_server_id"));
+    }
+    state
+        .remote_mcp
+        .forget_oauth_credentials(&id)
+        .await
+        .map_err(internal_error)?;
     state
         .db
         .delete_remote_mcp_server(&id)
@@ -533,6 +650,7 @@ async fn start_mcp_oauth(
             d.issuer.as_str(),
             d.authorization_endpoint.as_str(),
             d.token_endpoint.as_str(),
+            d.revocation_endpoint.as_ref().map(|u| u.as_str()),
             d.resource.as_str(),
             &dpop_algs,
         )
@@ -760,6 +878,156 @@ async fn exchange_mcp_oauth(
         .map_err(internal_error)?;
 
     Ok(Json(McpOAuthExchangeResponse { server_id: id }))
+}
+
+async fn revoke_mcp_oauth(
+    State(state): State<AppState>,
+    AxumPath(server_id): AxumPath<String>,
+) -> Result<Json<RevokeMcpOAuthResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if !is_valid_provider_id(&server_id) {
+        return Err(bad_request("invalid_mcp_server_id"));
+    }
+
+    let servers = state
+        .db
+        .list_remote_mcp_servers()
+        .await
+        .map_err(internal_error)?;
+    let Some(server) = servers.into_iter().find(|s| s.id == server_id) else {
+        return Err(not_found("unknown_mcp_server"));
+    };
+
+    let rt_key = format!("oauth.mcp.{server_id}.refresh_token");
+    let raw_rt = state.secrets.get(&rt_key).await.map_err(internal_error)?;
+
+    let had_refresh_token = raw_rt.is_some();
+    let mut remote_revocation_attempted = false;
+    let mut remote_revocation_succeeded = false;
+
+    if let Some(raw_rt) = raw_rt
+        && let Ok(refresh_token) = String::from_utf8(raw_rt.into_inner())
+    {
+        // Discover revocation endpoint (RFC 7009) from stored metadata, falling back to live discovery.
+        let endpoint = url::Url::parse(&server.endpoint_url).map_err(internal_error)?;
+        let mut meta = state
+            .db
+            .get_remote_mcp_oauth(&server_id)
+            .await
+            .map_err(internal_error)?;
+
+        if meta
+            .as_ref()
+            .and_then(|m| m.revocation_endpoint.as_deref())
+            .is_none()
+        {
+            // Best-effort refresh of discovery info.
+            if let Ok(d) = state.oauth_discovery.discover(&endpoint).await {
+                let dpop_algs = d
+                    .dpop_signing_alg_values_supported
+                    .clone()
+                    .unwrap_or_default();
+                let _ = state
+                    .db
+                    .upsert_remote_mcp_oauth(
+                        &server_id,
+                        d.issuer.as_str(),
+                        d.authorization_endpoint.as_str(),
+                        d.token_endpoint.as_str(),
+                        d.revocation_endpoint.as_ref().map(|u| u.as_str()),
+                        d.resource.as_str(),
+                        &dpop_algs,
+                    )
+                    .await;
+                meta = state
+                    .db
+                    .get_remote_mcp_oauth(&server_id)
+                    .await
+                    .ok()
+                    .flatten();
+            }
+        }
+
+        if let Some(revocation_endpoint) = meta.and_then(|m| m.revocation_endpoint) {
+            let revocation_url = url::Url::parse(&revocation_endpoint).map_err(internal_error)?;
+
+            let client_id = state
+                .db
+                .get_remote_mcp_oauth_client(&server_id)
+                .await
+                .map_err(internal_error)?
+                .map(|r| r.client_id)
+                .unwrap_or_else(|| "briefcase-cli".to_string());
+
+            let http = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(20))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(internal_error)?;
+
+            let mut reqb = http.post(revocation_url.clone()).form(&[
+                ("token", refresh_token.as_str()),
+                ("token_type_hint", "refresh_token"),
+                ("client_id", client_id.as_str()),
+            ]);
+
+            // If we have a DPoP key handle for this server, attach a DPoP proof (best-effort).
+            let handle_key = format!("oauth.mcp.{server_id}.dpop_key_handle");
+            if let Some(raw) = state
+                .secrets
+                .get(&handle_key)
+                .await
+                .map_err(internal_error)?
+                && let Ok(h) = KeyHandle::from_json(&raw.into_inner())
+            {
+                let keys = SoftwareKeyManager::new(state.secrets.clone());
+                let signer = keys.signer(h);
+                if let Ok(proof) =
+                    briefcase_dpop::dpop_proof_for_token_endpoint(signer.as_ref(), &revocation_url)
+                        .await
+                {
+                    reqb = reqb.header("DPoP", proof);
+                }
+            }
+
+            remote_revocation_attempted = true;
+            match reqb.send().await {
+                Ok(resp) => {
+                    remote_revocation_succeeded = resp.status().is_success();
+                }
+                Err(_) => {
+                    remote_revocation_succeeded = false;
+                }
+            }
+        }
+    }
+
+    // Always delete local secrets and clear in-memory session cache.
+    state
+        .remote_mcp
+        .forget_oauth_credentials(&server_id)
+        .await
+        .map_err(internal_error)?;
+
+    state
+        .receipts
+        .append(serde_json::json!({
+            "kind": "oauth_revoke",
+            "target": "remote_mcp",
+            "server_id": server_id,
+            "had_refresh_token": had_refresh_token,
+            "remote_revocation_attempted": remote_revocation_attempted,
+            "remote_revocation_succeeded": remote_revocation_succeeded,
+            "ts": Utc::now().to_rfc3339(),
+        }))
+        .await
+        .map_err(|e| internal_error(anyhow::anyhow!(e.to_string())))?;
+
+    Ok(Json(RevokeMcpOAuthResponse {
+        server_id,
+        had_refresh_token,
+        remote_revocation_attempted,
+        remote_revocation_succeeded,
+    }))
 }
 
 async fn list_budgets(State(state): State<AppState>) -> Json<ListBudgetsResponse> {
@@ -1823,6 +2091,7 @@ mod tests {
     struct MockProviderState {
         paid: Arc<tokio::sync::Mutex<bool>>,
         pay_calls: Arc<tokio::sync::Mutex<u64>>,
+        oauth_revoke_calls: Arc<tokio::sync::Mutex<u64>>,
     }
 
     async fn start_mock_remote_mcp()
@@ -1933,6 +2202,8 @@ mod tests {
     struct MockOAuthMcpState {
         token_calls: Arc<tokio::sync::Mutex<u64>>,
         token_ok_calls: Arc<tokio::sync::Mutex<u64>>,
+        revoke_calls: Arc<tokio::sync::Mutex<u64>>,
+        revoke_ok_calls: Arc<tokio::sync::Mutex<u64>>,
         mcp_calls: Arc<tokio::sync::Mutex<u64>>,
         mcp_ok_calls: Arc<tokio::sync::Mutex<u64>>,
     }
@@ -1956,6 +2227,8 @@ mod tests {
             addr: SocketAddr,
             token_calls: Arc<tokio::sync::Mutex<u64>>,
             token_ok_calls: Arc<tokio::sync::Mutex<u64>>,
+            revoke_calls: Arc<tokio::sync::Mutex<u64>>,
+            revoke_ok_calls: Arc<tokio::sync::Mutex<u64>>,
             mcp_calls: Arc<tokio::sync::Mutex<u64>>,
             mcp_ok_calls: Arc<tokio::sync::Mutex<u64>>,
             conn: Arc<tokio::sync::Mutex<McpConnection>>,
@@ -2024,6 +2297,7 @@ mod tests {
                 "issuer": format!("http://{}/as", st.addr),
                 "authorization_endpoint": format!("http://{}/as/authorize", st.addr),
                 "token_endpoint": format!("http://{}/as/token", st.addr),
+                "revocation_endpoint": format!("http://{}/as/revoke", st.addr),
                 "scopes_supported": ["mcp.read"]
             }))
         }
@@ -2091,6 +2365,31 @@ mod tests {
             }
         }
 
+        #[derive(Debug, serde::Deserialize)]
+        struct RevokeForm {
+            token: Option<String>,
+            token_type_hint: Option<String>,
+            client_id: Option<String>,
+        }
+
+        async fn revoke(
+            AxumState(st): AxumState<MockServer>,
+            Form(body): Form<RevokeForm>,
+        ) -> (StatusCode, Json<serde_json::Value>) {
+            *st.revoke_calls.lock().await += 1;
+            let ok = body.token.as_deref() == Some("rt_mcp")
+                && body.token_type_hint.as_deref() == Some("refresh_token")
+                && body.client_id.as_deref() == Some("briefcase-cli");
+            if !ok {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":"invalid_revoke_request"})),
+                );
+            }
+            *st.revoke_ok_calls.lock().await += 1;
+            (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+        }
+
         async fn mcp(
             AxumState(st): AxumState<MockServer>,
             headers: HeaderMap,
@@ -2124,6 +2423,8 @@ mod tests {
 
         let token_calls = Arc::new(tokio::sync::Mutex::new(0));
         let token_ok_calls = Arc::new(tokio::sync::Mutex::new(0));
+        let revoke_calls = Arc::new(tokio::sync::Mutex::new(0));
+        let revoke_ok_calls = Arc::new(tokio::sync::Mutex::new(0));
         let mcp_calls = Arc::new(tokio::sync::Mutex::new(0));
         let mcp_ok_calls = Arc::new(tokio::sync::Mutex::new(0));
         let handler = Arc::new(Handler);
@@ -2133,11 +2434,14 @@ mod tests {
             .route("/.well-known/oauth-protected-resource", get(prm))
             .route("/as/.well-known/oauth-authorization-server", get(as_meta))
             .route("/as/token", post(token))
+            .route("/as/revoke", post(revoke))
             .route("/mcp", post(mcp))
             .with_state(MockServer {
                 addr,
                 token_calls: token_calls.clone(),
                 token_ok_calls: token_ok_calls.clone(),
+                revoke_calls: revoke_calls.clone(),
+                revoke_ok_calls: revoke_ok_calls.clone(),
                 mcp_calls: mcp_calls.clone(),
                 mcp_ok_calls: mcp_ok_calls.clone(),
                 conn,
@@ -2152,6 +2456,8 @@ mod tests {
             MockOAuthMcpState {
                 token_calls,
                 token_ok_calls,
+                revoke_calls,
+                revoke_ok_calls,
                 mcp_calls,
                 mcp_ok_calls,
             },
@@ -2301,6 +2607,8 @@ mod tests {
             addr: SocketAddr,
             token_calls: Arc<tokio::sync::Mutex<u64>>,
             token_ok_calls: Arc<tokio::sync::Mutex<u64>>,
+            revoke_calls: Arc<tokio::sync::Mutex<u64>>,
+            revoke_ok_calls: Arc<tokio::sync::Mutex<u64>>,
             mcp_calls: Arc<tokio::sync::Mutex<u64>>,
             mcp_ok_calls: Arc<tokio::sync::Mutex<u64>>,
             dpop_jwk: Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
@@ -2371,6 +2679,7 @@ mod tests {
                 "issuer": format!("http://{}/as", st.addr),
                 "authorization_endpoint": format!("http://{}/as/authorize", st.addr),
                 "token_endpoint": format!("http://{}/as/token", st.addr),
+                "revocation_endpoint": format!("http://{}/as/revoke", st.addr),
                 "scopes_supported": ["mcp.read"],
                 "dpop_signing_alg_values_supported": ["EdDSA"]
             }))
@@ -2471,6 +2780,64 @@ mod tests {
             }
         }
 
+        #[derive(Debug, serde::Deserialize)]
+        struct RevokeForm {
+            token: Option<String>,
+            token_type_hint: Option<String>,
+            client_id: Option<String>,
+        }
+
+        async fn revoke(
+            AxumState(st): AxumState<MockServer>,
+            headers: HeaderMap,
+            Form(body): Form<RevokeForm>,
+        ) -> (StatusCode, Json<serde_json::Value>) {
+            *st.revoke_calls.lock().await += 1;
+
+            let ok = body.token.as_deref() == Some("rt_mcp")
+                && body.token_type_hint.as_deref() == Some("refresh_token")
+                && body.client_id.as_deref() == Some("briefcase-cli");
+            if !ok {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":"invalid_revoke_request"})),
+                );
+            }
+
+            let proof = headers
+                .get("dpop")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or_default();
+            if proof.is_empty() {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error":"missing_dpop"})),
+                );
+            }
+
+            let expected_url = format!("http://{}/as/revoke", st.addr);
+            let expected_jwk = st.dpop_jwk.lock().await.clone();
+            let mut used = st.used_jtis.lock().await;
+            if verify_dpop(
+                proof,
+                "POST",
+                &expected_url,
+                None,
+                expected_jwk.as_ref(),
+                &mut used,
+            )
+            .is_err()
+            {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error":"bad_dpop"})),
+                );
+            }
+
+            *st.revoke_ok_calls.lock().await += 1;
+            (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+        }
+
         async fn mcp(
             AxumState(st): AxumState<MockServer>,
             headers: HeaderMap,
@@ -2528,6 +2895,8 @@ mod tests {
 
         let token_calls = Arc::new(tokio::sync::Mutex::new(0));
         let token_ok_calls = Arc::new(tokio::sync::Mutex::new(0));
+        let revoke_calls = Arc::new(tokio::sync::Mutex::new(0));
+        let revoke_ok_calls = Arc::new(tokio::sync::Mutex::new(0));
         let mcp_calls = Arc::new(tokio::sync::Mutex::new(0));
         let mcp_ok_calls = Arc::new(tokio::sync::Mutex::new(0));
         let handler = Arc::new(Handler);
@@ -2537,11 +2906,14 @@ mod tests {
             .route("/.well-known/oauth-protected-resource", get(prm))
             .route("/as/.well-known/oauth-authorization-server", get(as_meta))
             .route("/as/token", post(token))
+            .route("/as/revoke", post(revoke))
             .route("/mcp", post(mcp))
             .with_state(MockServer {
                 addr,
                 token_calls: token_calls.clone(),
                 token_ok_calls: token_ok_calls.clone(),
+                revoke_calls: revoke_calls.clone(),
+                revoke_ok_calls: revoke_ok_calls.clone(),
                 mcp_calls: mcp_calls.clone(),
                 mcp_ok_calls: mcp_ok_calls.clone(),
                 dpop_jwk: Arc::new(tokio::sync::Mutex::new(None)),
@@ -2558,6 +2930,8 @@ mod tests {
             MockOAuthMcpState {
                 token_calls,
                 token_ok_calls,
+                revoke_calls,
+                revoke_ok_calls,
                 mcp_calls,
                 mcp_ok_calls,
             },
@@ -2567,7 +2941,7 @@ mod tests {
 
     async fn start_mock_provider()
     -> anyhow::Result<(SocketAddr, MockProviderState, tokio::task::JoinHandle<()>)> {
-        use axum::extract::State as AxumState;
+        use axum::extract::{Form, State as AxumState};
         use axum::http::HeaderMap;
         use axum::routing::{get, post};
         use axum::{Json, Router};
@@ -2694,6 +3068,32 @@ mod tests {
             }
         }
 
+        #[derive(Debug, serde::Deserialize)]
+        struct OAuthRevokeForm {
+            token: Option<String>,
+            token_type_hint: Option<String>,
+            client_id: Option<String>,
+        }
+
+        async fn oauth_revoke(
+            AxumState(st): AxumState<MockProviderState>,
+            Form(body): Form<OAuthRevokeForm>,
+        ) -> (StatusCode, Json<serde_json::Value>) {
+            *st.oauth_revoke_calls.lock().await += 1;
+            let token_ok = matches!(body.token.as_deref(), Some("rt_mock") | Some("rt_mock2"));
+            let ok = token_ok
+                && body.token_type_hint.as_deref() == Some("refresh_token")
+                && body.client_id.as_deref() == Some("briefcase-cli");
+            if !ok {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":"invalid_revoke_request"})),
+                );
+            }
+            // RFC 7009 recommends returning 200 even for unknown tokens.
+            (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+        }
+
         async fn vc_issue(headers: HeaderMap) -> (StatusCode, Json<serde_json::Value>) {
             let ok = headers
                 .get("authorization")
@@ -2719,7 +3119,7 @@ mod tests {
             let ok = headers
                 .get("authorization")
                 .and_then(|h| h.to_str().ok())
-                .map(|v| v == "Bearer cap")
+                .map(|v| v == "Bearer cap" || v == "DPoP cap")
                 .unwrap_or(false);
             if !ok {
                 return (
@@ -2745,12 +3145,14 @@ mod tests {
         let st = MockProviderState {
             paid: Arc::new(tokio::sync::Mutex::new(false)),
             pay_calls: Arc::new(tokio::sync::Mutex::new(0)),
+            oauth_revoke_calls: Arc::new(tokio::sync::Mutex::new(0)),
         };
 
         let app = Router::new()
             .route("/token", post(token))
             .route("/pay", post(pay))
             .route("/oauth/token", post(oauth_token))
+            .route("/oauth/revoke", post(oauth_revoke))
             .route("/vc/issue", post(vc_issue))
             .route("/api/quote", get(quote))
             .with_state(st.clone());
@@ -2888,7 +3290,10 @@ mod tests {
                 },
             })
             .await?;
-        assert!(matches!(resp, CallToolResponse::Ok { .. }));
+        assert!(
+            matches!(resp, CallToolResponse::Ok { .. }),
+            "unexpected first quote response: {resp:?}"
+        );
 
         // Receipts exist.
         let receipts = client.list_receipts().await?.receipts;
@@ -3398,7 +3803,10 @@ mod tests {
                 },
             })
             .await?;
-        assert!(matches!(resp, CallToolResponse::Ok { .. }));
+        assert!(
+            matches!(resp, CallToolResponse::Ok { .. }),
+            "unexpected second quote response: {resp:?}"
+        );
 
         let pay_calls = *provider_state.pay_calls.lock().await;
         assert_eq!(pay_calls, 0, "expected quote path to avoid payment");
@@ -3750,6 +4158,176 @@ mod tests {
             .find(|s| s.id == "secure_status1")
             .context("server missing from list")?;
         assert!(a.has_oauth_refresh, "expected oauth connected");
+
+        daemon_task.abort();
+        secure_task.abort();
+        provider_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn revoke_provider_oauth_deletes_secret_and_forces_payment() -> anyhow::Result<()> {
+        let (provider_addr, provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let (state, _daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
+
+        // Store OAuth refresh token in the daemon.
+        client
+            .oauth_exchange(
+                "demo",
+                OAuthExchangeRequest {
+                    code: "code_mock".to_string(),
+                    redirect_uri: "http://127.0.0.1/callback".to_string(),
+                    client_id: "briefcase-cli".to_string(),
+                    code_verifier: "verifier".to_string(),
+                },
+            )
+            .await?;
+
+        // Quote should succeed without paying (OAuth capability minting path).
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "quote".to_string(),
+                    args: serde_json::json!({ "symbol": "TEST" }),
+                    context: ToolCallContext::new(),
+                    approval_token: None,
+                },
+            })
+            .await?;
+        assert!(
+            matches!(resp, CallToolResponse::Ok { .. }),
+            "unexpected first quote response: {resp:?}"
+        );
+        assert_eq!(*provider_state.pay_calls.lock().await, 0);
+
+        let revoked = client.revoke_provider_oauth("demo").await?;
+        assert!(revoked.had_refresh_token);
+        assert!(revoked.remote_revocation_attempted);
+        assert!(revoked.remote_revocation_succeeded);
+
+        assert_eq!(*provider_state.oauth_revoke_calls.lock().await, 1);
+        assert!(
+            state
+                .secrets
+                .get("oauth.demo.refresh_token")
+                .await
+                .unwrap()
+                .is_none(),
+            "refresh token should be deleted"
+        );
+
+        // Cached capability is cleared; the next quote must go through payment fallback.
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "quote".to_string(),
+                    args: serde_json::json!({ "symbol": "TEST" }),
+                    context: ToolCallContext::new(),
+                    approval_token: None,
+                },
+            })
+            .await?;
+        assert!(
+            matches!(resp, CallToolResponse::Ok { .. }),
+            "unexpected second quote response: {resp:?}"
+        );
+        assert_eq!(*provider_state.pay_calls.lock().await, 1);
+
+        daemon_task.abort();
+        provider_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn revoke_remote_mcp_oauth_deletes_refresh_and_dpop_handle() -> anyhow::Result<()> {
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let (secure_addr, oauth_state, secure_task) = start_mock_oauth_dpop_protected_mcp().await?;
+        let secure_endpoint = format!("http://{secure_addr}/mcp");
+
+        let (state, _daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
+
+        client
+            .upsert_mcp_server("secure_dpop_revoke1", secure_endpoint.clone())
+            .await?;
+
+        let started = client
+            .mcp_oauth_start(
+                "secure_dpop_revoke1",
+                McpOAuthStartRequest {
+                    client_id: "briefcase-cli".to_string(),
+                    redirect_uri: "http://127.0.0.1/callback".to_string(),
+                    scope: Some("mcp.read".to_string()),
+                },
+            )
+            .await?;
+
+        client
+            .mcp_oauth_exchange(
+                "secure_dpop_revoke1",
+                McpOAuthExchangeRequest {
+                    code: "code_mock".to_string(),
+                    state: started.state,
+                },
+            )
+            .await?;
+
+        assert!(
+            state
+                .secrets
+                .get("oauth.mcp.secure_dpop_revoke1.refresh_token")
+                .await
+                .unwrap()
+                .is_some(),
+            "refresh token should exist before revoke"
+        );
+        assert!(
+            state
+                .secrets
+                .get("oauth.mcp.secure_dpop_revoke1.dpop_key_handle")
+                .await
+                .unwrap()
+                .is_some(),
+            "dpop key handle should exist before revoke"
+        );
+
+        let revoked = client.revoke_mcp_oauth("secure_dpop_revoke1").await?;
+        assert!(revoked.had_refresh_token);
+        assert!(revoked.remote_revocation_attempted);
+        assert!(revoked.remote_revocation_succeeded);
+        assert_eq!(*oauth_state.revoke_calls.lock().await, 1);
+        assert_eq!(*oauth_state.revoke_ok_calls.lock().await, 1);
+
+        assert!(
+            state
+                .secrets
+                .get("oauth.mcp.secure_dpop_revoke1.refresh_token")
+                .await
+                .unwrap()
+                .is_none(),
+            "refresh token should be deleted"
+        );
+        assert!(
+            state
+                .secrets
+                .get("oauth.mcp.secure_dpop_revoke1.dpop_key_handle")
+                .await
+                .unwrap()
+                .is_none(),
+            "dpop key handle should be deleted"
+        );
+
+        // Tools should no longer be listable without OAuth.
+        let tools = client.list_tools().await?.tools;
+        assert!(
+            !tools
+                .iter()
+                .any(|t| t.id == "mcp_secure_dpop_revoke1__hello"),
+            "remote tool should be absent after OAuth disconnect"
+        );
 
         daemon_task.abort();
         secure_task.abort();

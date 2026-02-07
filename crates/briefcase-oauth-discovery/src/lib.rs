@@ -14,6 +14,8 @@ pub struct OAuthDiscoveryResult {
     pub issuer: Url,
     pub authorization_endpoint: Url,
     pub token_endpoint: Url,
+    /// RFC 7009 token revocation endpoint, if advertised by the authorization server.
+    pub revocation_endpoint: Option<Url>,
     pub scopes_supported: Option<Vec<String>>,
     pub dpop_signing_alg_values_supported: Option<Vec<String>>,
 }
@@ -45,6 +47,8 @@ struct AuthorizationServerMetadata {
     issuer: Option<String>,
     authorization_endpoint: Option<String>,
     token_endpoint: Option<String>,
+    #[serde(default)]
+    revocation_endpoint: Option<String>,
     #[serde(default)]
     scopes_supported: Option<Vec<String>>,
     #[serde(default)]
@@ -129,6 +133,15 @@ impl OAuthDiscoveryClient {
             .map_err(OAuthDiscoveryError::InsecureUrl)?;
         validate_https_or_loopback(&token_endpoint).map_err(OAuthDiscoveryError::InsecureUrl)?;
 
+        let revocation_endpoint = match as_meta.revocation_endpoint.as_deref() {
+            Some(raw) if !raw.trim().is_empty() => {
+                let u = Url::parse(raw).context("parse revocation_endpoint")?;
+                validate_https_or_loopback(&u).map_err(OAuthDiscoveryError::InsecureUrl)?;
+                Some(u)
+            }
+            _ => None,
+        };
+
         let resource = match prm.resource {
             Some(r) => Url::parse(&r).context("parse prm.resource")?,
             None => protected_resource.clone(),
@@ -139,6 +152,7 @@ impl OAuthDiscoveryClient {
             issuer,
             authorization_endpoint,
             token_endpoint,
+            revocation_endpoint,
             scopes_supported: as_meta.scopes_supported.or(prm.scopes_supported),
             dpop_signing_alg_values_supported: as_meta.dpop_signing_alg_values_supported,
         };
@@ -315,6 +329,7 @@ mod tests {
                 "issuer": format!("http://127.0.0.1:{}/as", st.port),
                 "authorization_endpoint": format!("http://127.0.0.1:{}/as/authorize", st.port),
                 "token_endpoint": format!("http://127.0.0.1:{}/as/token", st.port),
+                "revocation_endpoint": format!("http://127.0.0.1:{}/as/revoke", st.port),
                 "scopes_supported": ["mcp.read", "mcp.write"]
             }))
         }
@@ -358,6 +373,13 @@ mod tests {
         assert_eq!(
             d1.token_endpoint.as_str(),
             base.join("/as/token").unwrap().as_str()
+        );
+        assert_eq!(
+            d1.revocation_endpoint
+                .as_ref()
+                .expect("missing revocation_endpoint")
+                .as_str(),
+            base.join("/as/revoke").unwrap().as_str()
         );
         assert_eq!(d1.scopes_supported.unwrap().len(), 2);
 

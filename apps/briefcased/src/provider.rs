@@ -132,6 +132,10 @@ impl ProviderClient {
         ))
     }
 
+    pub async fn forget_cached_token(&self, provider_id: &str) {
+        self.cached.lock().await.remove(provider_id);
+    }
+
     async fn get_quote_with_token(
         &self,
         provider_id: &str,

@@ -245,7 +245,7 @@ For each task, include:
 
 ## Phase 9: Revocation + Status Lists
 
-- [ ] 9.1 OAuth revoke/forget flows
+- [x] 9.1 OAuth revoke/forget flows
   - **Do**: add revoke endpoints; implement provider-optional RFC7009 call; always delete local secret.
   - **Files**: `apps/briefcased/src/oauth.rs`, `apps/briefcase-extension/*`, `apps/briefcase-cli/*`
   - **Done when**: revocation works end-to-end and removes secrets.

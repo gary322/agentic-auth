@@ -235,6 +235,29 @@ impl RemoteMcpManager {
         ))
     }
 
+    pub async fn evict_session(&self, server_id: &str) {
+        self.sessions.lock().await.remove(server_id);
+    }
+
+    pub async fn forget_oauth_credentials(&self, server_id: &str) -> anyhow::Result<()> {
+        self.evict_session(server_id).await;
+
+        // Refresh token.
+        let rt_key = format!("oauth.mcp.{server_id}.refresh_token");
+        self.secrets.delete(&rt_key).await?;
+
+        // DPoP key handle + backing key material (best-effort).
+        let handle_key = format!("oauth.mcp.{server_id}.dpop_key_handle");
+        if let Some(raw) = self.secrets.get(&handle_key).await?
+            && let Ok(h) = KeyHandle::from_json(&raw.into_inner())
+        {
+            let _ = self.keys.delete(&h).await;
+        }
+        self.secrets.delete(&handle_key).await?;
+
+        Ok(())
+    }
+
     async fn session_for(
         &self,
         server: &RemoteMcpServerRecord,
@@ -436,6 +459,7 @@ impl RemoteMcpManager {
                             d.issuer.as_str(),
                             d.authorization_endpoint.as_str(),
                             d.token_endpoint.as_str(),
+                            d.revocation_endpoint.as_ref().map(|u| u.as_str()),
                             d.resource.as_str(),
                             &dpop_algs,
                         )

@@ -137,6 +137,11 @@ async fn handle(client: &BriefcaseClient, req: NativeRequest) -> anyhow::Result<
     }
 
     #[derive(Debug, Deserialize)]
+    struct RevokeMcpOauthParams {
+        server_id: String,
+    }
+
+    #[derive(Debug, Deserialize)]
     struct UpsertProviderParams {
         provider_id: String,
         base_url: String,
@@ -149,6 +154,11 @@ async fn handle(client: &BriefcaseClient, req: NativeRequest) -> anyhow::Result<
 
     #[derive(Debug, Deserialize)]
     struct DeleteProviderParams {
+        provider_id: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct RevokeProviderOauthParams {
         provider_id: String,
     }
 
@@ -211,6 +221,13 @@ async fn handle(client: &BriefcaseClient, req: NativeRequest) -> anyhow::Result<
                 serde_json::from_value(req.params).context("parse params")?;
             Ok(ok_json!(client.delete_provider(&p.provider_id).await?))
         }
+        "revoke_provider_oauth" => {
+            let p: RevokeProviderOauthParams =
+                serde_json::from_value(req.params).context("parse params")?;
+            Ok(ok_json!(
+                client.revoke_provider_oauth(&p.provider_id).await?
+            ))
+        }
         "list_mcp_servers" => Ok(ok_json!(client.list_mcp_servers().await?)),
         "upsert_mcp_server" => {
             let p: UpsertMcpServerParams =
@@ -225,6 +242,11 @@ async fn handle(client: &BriefcaseClient, req: NativeRequest) -> anyhow::Result<
             let p: DeleteMcpServerParams =
                 serde_json::from_value(req.params).context("parse params")?;
             Ok(ok_json!(client.delete_mcp_server(&p.server_id).await?))
+        }
+        "revoke_mcp_oauth" => {
+            let p: RevokeMcpOauthParams =
+                serde_json::from_value(req.params).context("parse params")?;
+            Ok(ok_json!(client.revoke_mcp_oauth(&p.server_id).await?))
         }
         "mcp_oauth_start" => {
             let p: McpOAuthStartParams =
