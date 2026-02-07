@@ -8,6 +8,7 @@ members = [
   "apps/briefcased",
   "apps/native-messaging-host",
   "apps/mcp-gateway",
+  "crates/briefcase-ai",
   "crates/briefcase-api",
   "crates/briefcase-core",
   "crates/briefcase-dpop",

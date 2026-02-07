@@ -266,7 +266,7 @@ For each task, include:
 
 ## Phase 10: AI Policy Compiler + Consent Copilot + Anomaly Detection
 
-- [ ] 10.1 Define AI interface and “non-authoritative” invariants
+- [x] 10.1 Define AI interface and “non-authoritative” invariants
   - **Do**: add `crates/briefcase-ai` with strict rules; add test corpus ensuring AI can’t bypass policy.
   - **Files**: `crates/briefcase-ai/*`, `docs/AI_SAFETY.md`
   - **Done when**: AI is optional and cannot influence allow decisions except by requiring approval.
