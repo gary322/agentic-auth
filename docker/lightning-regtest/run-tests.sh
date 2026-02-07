@@ -108,8 +108,8 @@ wait_for "lnd-bob macaroon" dc exec -T lnd-bob sh -lc 'test -f /root/.lnd/data/c
 # The LND containers create `tls.cert` and macaroons as root with restrictive
 # permissions. The integration tests read these files from the host-mounted
 # volume, so ensure they are readable in CI.
-dc exec -T lnd-alice sh -lc 'chmod a+r /root/.lnd/tls.cert || true; chmod -R a+rX /root/.lnd/data/chain/bitcoin/regtest || true'
-dc exec -T lnd-bob sh -lc 'chmod a+r /root/.lnd/tls.cert || true; chmod -R a+rX /root/.lnd/data/chain/bitcoin/regtest || true'
+dc exec -T --user root lnd-alice sh -lc 'chmod a+rx /root/.lnd || true; chmod a+r /root/.lnd/tls.cert || true; chmod -R a+rX /root/.lnd/data || true'
+dc exec -T --user root lnd-bob sh -lc 'chmod a+rx /root/.lnd || true; chmod a+r /root/.lnd/tls.cert || true; chmod -R a+rX /root/.lnd/data || true'
 
 cln_carol_synced() {
   dc exec -T cln-carol lightning-cli --network=regtest --lightning-dir=/root/.lightning --rpc-file=/root/.lightning/lightning-rpc getinfo | python3 -c 'import json,sys; obj=json.load(sys.stdin); sys.exit(0 if not obj.get("warning_bitcoind_sync") else 1)'

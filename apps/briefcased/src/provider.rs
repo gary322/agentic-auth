@@ -972,18 +972,22 @@ mod tests {
             }
         };
         let hash_bytes = hex::decode(&expected_hash).unwrap_or_default();
-        if let Ok(inv) = client.lookup_invoice(&hash_bytes).await {
-            if inv.state != 1 {
-                return (
-                    AxumStatusCode::PAYMENT_REQUIRED,
-                    Json(serde_json::json!({"error":"invoice_not_settled"})),
-                )
-                    .into_response();
+        let mut settled = false;
+        for _ in 0..50 {
+            match client.lookup_invoice(&hash_bytes).await {
+                Ok(inv) if inv.state == 1 => {
+                    settled = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => {}
             }
-        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        if !settled {
             return (
-                AxumStatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({"error":"lookup_failed"})),
+                AxumStatusCode::PAYMENT_REQUIRED,
+                Json(serde_json::json!({"error":"invoice_not_settled"})),
             )
                 .into_response();
         }
@@ -1215,9 +1219,17 @@ mod tests {
                 .into_response();
         }
 
-        let paid = briefcase_payments::l402_cln::is_invoice_paid(&st.payee_socket, &expected_hash)
-            .await
-            .unwrap_or(false);
+        let mut paid = false;
+        for _ in 0..50 {
+            if briefcase_payments::l402_cln::is_invoice_paid(&st.payee_socket, &expected_hash)
+                .await
+                .unwrap_or(false)
+            {
+                paid = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
         if !paid {
             return (
                 AxumStatusCode::PAYMENT_REQUIRED,
