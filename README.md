@@ -25,88 +25,88 @@ Credential Briefcase centralizes **custody, enforcement, payment, and auditing**
 ### System Overview
 
 ```mermaid
-flowchart LR
+graph LR
   subgraph Agent[Untrusted agent runtime]
-    A[LLM / Agent]
+    A[LLM agent]
   end
 
-  subgraph Local[Briefcase boundary (local-first)]
-    G[mcp-gateway]
-    D[briefcased]
-    S[briefcase-sandbox]
-    K[Secret + key custody]
+  subgraph Local[Briefcase boundary local first]
+    G[MCP gateway]
+    D[Briefcase daemon]
+    S[Tool sandbox]
+    K[Secrets and keys]
     R[Receipts store]
-    X[Browser extension + native host]
+    X[Browser extension]
     M[Mobile signer]
   end
 
-  subgraph Providers[Providers / remote systems]
+  subgraph Providers[Providers and remote systems]
     RMCP[Remote MCP servers]
     P[Provider APIs]
-    PG[agent-access-gateway]
-    L[Lightning node LND or CLN]
+    PG[Agent access gateway]
+    L[Lightning node]
     C[x402 stablecoin rails]
     CP[Enterprise control plane]
   end
 
-  A -->|MCP stdio or streamable HTTP| G
-  G -->|local IPC| D
+  A --> G
+  G --> D
   D --> S
   D --> K
   D --> R
-  X -->|onboarding + approvals| D
-  M -->|signed approvals| D
+  X --> D
+  M --> D
 
-  D -->|remote MCP routing| RMCP
-  D -->|capabilities + PoP| PG
+  D --> RMCP
+  D --> PG
   PG --> P
-  D -->|L402 payments| L
-  D -->|x402 proofs| C
-  CP -->|signed policy bundle| D
-  D -->|receipt uploads| CP
+  D --> L
+  D --> C
+  CP --> D
+  D --> CP
 ```
 
 ### Tool Call Sequence (Happy Path + Approvals)
 
 ```mermaid
 sequenceDiagram
-  participant Agent as LLM / Agent (untrusted)
-  participant Gateway as mcp-gateway
-  participant Daemon as briefcased
-  participant Policy as Policy/Budget/Risk
-  participant UI as Extension/CLI/UI/Mobile signer
-  participant Provider as Provider (API/MCP)
+  participant Agent as LLM agent untrusted
+  participant Gateway as MCP gateway
+  participant Daemon as Briefcase daemon
+  participant Policy as Policy Budget Risk
+  participant UI as Extension CLI UI Mobile signer
+  participant Provider as Provider API MCP
   participant Receipts as Receipts store
 
-  Agent->>Gateway: tools/call(name, args)
-  Gateway->>Daemon: ExecuteTool(call)
-  Daemon->>Policy: validate + policy + budgets + risk
+  Agent->>Gateway: tools call name args
+  Gateway->>Daemon: execute tool
+  Daemon->>Policy: validate policy budgets risk
 
   alt Approval required
-    Daemon-->>Gateway: approval_required(approval_id)
-    Gateway-->>Agent: error + approval metadata
-    UI->>Daemon: approve(approval_id, optional signature)
-    Agent->>Gateway: tools/call(..., approval_token)
-    Gateway->>Daemon: ExecuteTool(call, approval_token)
+    Daemon-->>Gateway: approval required approval id
+    Gateway-->>Agent: error and approval metadata
+    UI->>Daemon: approve approval id optional signature
+    Agent->>Gateway: tools call with approval token
+    Gateway->>Daemon: execute tool with approval token
   end
 
-  Daemon->>Provider: request with capability token and PoP
+  Daemon->>Provider: request with capability and proof of possession
   Provider-->>Daemon: result
-  Daemon->>Receipts: append receipt (hash-chained)
-  Daemon-->>Gateway: redacted result + provenance
+  Daemon->>Receipts: append receipt hash chained
+  Daemon-->>Gateway: redacted result and provenance
   Gateway-->>Agent: tool result
 ```
 
 ### Enterprise Mode (Reference Control Plane)
 
 ```mermaid
-flowchart LR
-  Admin["Admin"] -->|set policy/budgets| CP["briefcase-control-plane"]
-  CP -->|signed policy bundle| D["briefcased on devices"]
-  D -->|upload receipts| CP
-  Auditor["Auditor"] -->|query receipts| CP
-  CP -. optional .-> RS["Remote signer service"]
-  RS -. signs .-> D
+graph LR
+  Admin[Admin] --> CP[Briefcase control plane]
+  CP --> D[Briefcase daemon on devices]
+  D --> CP
+  Auditor[Auditor] --> CP
+  CP -.-> RS[Remote signer service]
+  RS -.-> D
 ```
 
 ## How It Works (End To End)
