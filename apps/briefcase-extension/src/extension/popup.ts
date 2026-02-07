@@ -75,6 +75,22 @@ type ReceiptRecord = {
   event: unknown;
 };
 
+type AiSeverity = "low" | "medium" | "high";
+
+type AiAnomalyKind =
+  | "spend_spike"
+  | "output_poisoning"
+  | "expensive_call"
+  | "new_domain";
+
+type AiAnomaly = {
+  kind: AiAnomalyKind;
+  severity: AiSeverity;
+  message: string;
+  receipt_id: number | null;
+  ts_rfc3339: string | null;
+};
+
 let lastPolicyProposal: PolicyProposal | null = null;
 
 function el<T extends HTMLElement>(id: string): T {
@@ -130,6 +146,13 @@ function mkPill(ok: boolean, okText: string, noText: string): HTMLDivElement {
   const pill = document.createElement("div");
   pill.className = `pill ${ok ? "ok" : "no"}`;
   pill.innerText = ok ? okText : noText;
+  return pill;
+}
+
+function mkSeverityPill(sev: AiSeverity): HTMLDivElement {
+  const pill = document.createElement("div");
+  pill.className = `pill ${sev === "high" ? "no" : "ok"}`;
+  pill.innerText = sev;
   return pill;
 }
 
@@ -353,6 +376,19 @@ async function loadApprovals(): Promise<void> {
     detail.innerText = `kind: ${a.kind} | expires: ${a.expires_at}`;
     box.appendChild(detail);
 
+    const summaryObj =
+      a.summary && typeof a.summary === "object" ? (a.summary as any) : null;
+    const copilot =
+      summaryObj && typeof summaryObj.copilot_summary === "string"
+        ? String(summaryObj.copilot_summary)
+        : "";
+    if (copilot) {
+      const s = document.createElement("div");
+      s.className = "url";
+      s.innerText = copilot;
+      box.appendChild(s);
+    }
+
     const pre = document.createElement("pre");
     pre.className = "url";
     pre.innerText = prettyJson(a.summary);
@@ -384,6 +420,39 @@ async function loadApprovals(): Promise<void> {
 
     actions.appendChild(approve);
     box.appendChild(actions);
+
+    root.appendChild(box);
+  }
+}
+
+async function loadAlerts(): Promise<void> {
+  const root = el<HTMLDivElement>("alerts");
+  root.innerHTML = "";
+
+  const res = await rpc<{ anomalies: AiAnomaly[] }>("ai_anomalies", { limit: 200 });
+  if (res.anomalies.length === 0) {
+    const p = document.createElement("p");
+    p.className = "status";
+    p.innerText = "No alerts.";
+    root.appendChild(p);
+    return;
+  }
+
+  for (const a of res.anomalies) {
+    const box = mkItem();
+    box.appendChild(mkRowLeftRight(a.kind, mkSeverityPill(a.severity)));
+
+    const msg = document.createElement("div");
+    msg.className = "url";
+    msg.innerText = a.message;
+    box.appendChild(msg);
+
+    const meta = document.createElement("div");
+    meta.className = "url";
+    const rid = a.receipt_id !== null ? `receipt=${a.receipt_id}` : "receipt=-";
+    const ts = a.ts_rfc3339 ?? "-";
+    meta.innerText = `${rid} | ts=${ts}`;
+    box.appendChild(meta);
 
     root.appendChild(box);
   }
@@ -614,6 +683,7 @@ function setupTabs(): void {
         await loadApprovals();
         startApprovalsPolling();
       }
+      if (tab === "alerts") await loadAlerts();
       if (tab === "receipts") await loadReceipts();
       if (tab === "budgets") await loadBudgets();
       if (tab === "policy") await loadPolicy();
@@ -651,6 +721,13 @@ function setupActions(): void {
   el<HTMLButtonElement>("refresh-approvals").addEventListener("click", () => {
     setStatus("Refreshing...");
     loadApprovals()
+      .then(() => setStatus(""))
+      .catch((e) => setStatus(errorMessage(e)));
+  });
+
+  el<HTMLButtonElement>("refresh-alerts").addEventListener("click", () => {
+    setStatus("Refreshing...");
+    loadAlerts()
       .then(() => setStatus(""))
       .catch((e) => setStatus(errorMessage(e)));
   });

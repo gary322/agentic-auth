@@ -94,6 +94,7 @@ test("popup flows: servers/providers/approvals/receipts/budgets", async ({ page 
       servers: McpServerSummary[];
       providers: ProviderSummary[];
       approvals: unknown[];
+      anomalies: unknown[];
       receipts: unknown[];
       budgets: { category: string; daily_limit_microusd: number }[];
     } = {
@@ -120,7 +121,20 @@ test("popup flows: servers/providers/approvals/receipts/budgets", async ({ page 
           expires_at: "2026-01-01T00:10:00Z",
           tool_id: "demo.write",
           reason: "requires_approval",
-          summary: { action: "write", cost_microusd: 30 },
+          summary: {
+            action: "write",
+            cost_microusd: 30,
+            copilot_summary: "Approve write tool call: demo.write | reason=requires_approval",
+          },
+        },
+      ],
+      anomalies: [
+        {
+          kind: "output_poisoning",
+          severity: "high",
+          message: "tool output contained suspicious instruction signals",
+          receipt_id: 1,
+          ts_rfc3339: "2026-01-01T00:00:00Z",
         },
       ],
       receipts: [
@@ -206,6 +220,8 @@ test("popup flows: servers/providers/approvals/receipts/budgets", async ({ page 
                 state.approvals = state.approvals.filter((a: any) => a.id !== id);
                 return ok({ id });
               }
+              case "ai_anomalies":
+                return ok({ anomalies: state.anomalies });
               case "list_receipts": {
                 const limit = Number(params.limit ?? 50);
                 const offset = Number(params.offset ?? 0);
@@ -268,8 +284,17 @@ test("popup flows: servers/providers/approvals/receipts/budgets", async ({ page 
   // Approvals tab.
   await page.getByRole("button", { name: "Approvals" }).click();
   await expect(page.getByText("demo.write")).toBeVisible();
+  await expect(
+    page.getByText("Approve write tool call: demo.write", { exact: false }),
+  ).toBeVisible();
   await page.getByRole("button", { name: "Approve" }).click();
   await expect(page.getByText("No pending approvals.")).toBeVisible();
+
+  // Alerts tab.
+  await page.getByRole("button", { name: "Alerts" }).click();
+  await expect(
+    page.getByText("tool output contained suspicious instruction signals"),
+  ).toBeVisible();
 
   // Receipts tab.
   await page.getByRole("button", { name: "Receipts" }).click();

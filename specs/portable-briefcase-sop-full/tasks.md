@@ -279,7 +279,7 @@ For each task, include:
   - **Done when**: user can type natural language policy and apply a verified diff.
   - **Verify**: e2e tests with deterministic stub LLM.
 
-- [ ] 10.3 Implement consent copilot + anomaly dashboard
+- [x] 10.3 Implement consent copilot + anomaly dashboard
   - **Do**: generate summaries for approvals; detect spend spikes/new domains/output poisoning patterns from receipts stream.
   - **Files**: `crates/briefcase-ai/*`, `apps/briefcase-extension/*`, `apps/briefcase-ui/*`
   - **Done when**: anomalies appear as alerts; approvals have plain-language summaries.

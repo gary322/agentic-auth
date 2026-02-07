@@ -14,15 +14,16 @@ use serde::de::DeserializeOwned;
 use thiserror::Error;
 
 use crate::types::{
-    ApproveResponse, BudgetRecord, CallToolRequest, CallToolResponse, DeleteMcpServerResponse,
-    DeleteProviderResponse, ErrorResponse, FetchVcResponse, IdentityResponse,
-    ListApprovalsResponse, ListBudgetsResponse, ListMcpServersResponse, ListProvidersResponse,
-    ListReceiptsResponse, ListToolsResponse, McpOAuthExchangeRequest, McpOAuthExchangeResponse,
-    McpOAuthStartRequest, McpOAuthStartResponse, McpServerSummary, OAuthExchangeRequest,
-    OAuthExchangeResponse, PolicyApplyResponse, PolicyCompileRequest, PolicyCompileResponse,
-    PolicyGetResponse, ProviderSummary, RevokeMcpOAuthResponse, RevokeProviderOAuthResponse,
-    SetBudgetRequest, SignerPairCompleteRequest, SignerPairCompleteResponse,
-    SignerPairStartResponse, UpsertMcpServerRequest, UpsertProviderRequest, VerifyReceiptsResponse,
+    AiAnomaliesResponse, ApproveResponse, BudgetRecord, CallToolRequest, CallToolResponse,
+    DeleteMcpServerResponse, DeleteProviderResponse, ErrorResponse, FetchVcResponse,
+    IdentityResponse, ListApprovalsResponse, ListBudgetsResponse, ListMcpServersResponse,
+    ListProvidersResponse, ListReceiptsResponse, ListToolsResponse, McpOAuthExchangeRequest,
+    McpOAuthExchangeResponse, McpOAuthStartRequest, McpOAuthStartResponse, McpServerSummary,
+    OAuthExchangeRequest, OAuthExchangeResponse, PolicyApplyResponse, PolicyCompileRequest,
+    PolicyCompileResponse, PolicyGetResponse, ProviderSummary, RevokeMcpOAuthResponse,
+    RevokeProviderOAuthResponse, SetBudgetRequest, SignerPairCompleteRequest,
+    SignerPairCompleteResponse, SignerPairStartResponse, UpsertMcpServerRequest,
+    UpsertProviderRequest, VerifyReceiptsResponse,
 };
 
 #[derive(Debug, Clone)]
@@ -297,6 +298,16 @@ impl BriefcaseClient {
 
     pub async fn verify_receipts(&self) -> Result<VerifyReceiptsResponse, BriefcaseClientError> {
         self.post_json("/v1/receipts/verify", serde_json::json!({}))
+            .await
+    }
+
+    pub async fn ai_anomalies(
+        &self,
+        limit: u32,
+    ) -> Result<AiAnomaliesResponse, BriefcaseClientError> {
+        // Hard cap to avoid accidental giant responses in UI polling.
+        let limit = limit.min(1000);
+        self.get_json(&format!("/v1/ai/anomalies?limit={limit}"))
             .await
     }
 

@@ -192,6 +192,12 @@ async fn handle(client: &BriefcaseClient, req: NativeRequest) -> anyhow::Result<
     }
 
     #[derive(Debug, Deserialize)]
+    struct AiAnomaliesParams {
+        #[serde(default)]
+        limit: Option<u32>,
+    }
+
+    #[derive(Debug, Deserialize)]
     struct McpOAuthStartParams {
         server_id: String,
         client_id: String,
@@ -329,6 +335,12 @@ async fn handle(client: &BriefcaseClient, req: NativeRequest) -> anyhow::Result<
             Ok(ok_json!(client.list_receipts_paged(limit, offset).await?))
         }
         "verify_receipts" => Ok(ok_json!(client.verify_receipts().await?)),
+        "ai_anomalies" => {
+            let p: AiAnomaliesParams =
+                serde_json::from_value(req.params).context("parse params")?;
+            let limit = p.limit.unwrap_or(200);
+            Ok(ok_json!(client.ai_anomalies(limit).await?))
+        }
         other => Ok(NativeResponse {
             id,
             ok: false,

@@ -2,9 +2,10 @@ use anyhow::Context as _;
 use axum::Json;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
+use briefcase_ai::CopilotApprovalSummaryInput;
 use briefcase_api::types::{
-    ErrorResponse, PolicyApplyResponse, PolicyCompileRequest, PolicyCompileResponse, PolicyDiffLine,
-    PolicyDiffOp, PolicyGetResponse, PolicyProposal,
+    ErrorResponse, PolicyApplyResponse, PolicyCompileRequest, PolicyCompileResponse,
+    PolicyDiffLine, PolicyDiffOp, PolicyGetResponse, PolicyProposal,
 };
 use briefcase_core::{ApprovalKind, ApprovalRequest, util::sha256_hex};
 use briefcase_policy::{CedarPolicyEngine, CedarPolicyEngineOptions};
@@ -166,6 +167,16 @@ pub async fn policy_apply(
     let diff: Vec<PolicyDiffLine> =
         serde_json::from_str(&proposal.diff_json).unwrap_or_else(|_| Vec::new());
     let (diff_preview, truncated) = diff_preview(&diff, 120);
+    let copilot_summary =
+        briefcase_ai::copilot_summary_for_approval(&CopilotApprovalSummaryInput {
+            tool_id: POLICY_APPROVAL_TOOL_ID.to_string(),
+            category: "admin".to_string(),
+            reason: "policy change requires confirmation".to_string(),
+            approval_kind: "local".to_string(),
+            net_access: false,
+            fs_access: false,
+            estimated_cost_usd: None,
+        });
     let summary = serde_json::json!({
         "kind": "policy_apply",
         "proposal_id": proposal.id,
@@ -174,6 +185,7 @@ pub async fn policy_apply(
         "proposed_policy_hash_hex": proposal.proposed_policy_hash_hex,
         "diff_preview": diff_preview,
         "diff_truncated": truncated,
+        "copilot_summary": copilot_summary,
     });
 
     let approval = state

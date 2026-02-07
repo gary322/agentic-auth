@@ -119,6 +119,37 @@ pub struct VerifyReceiptsResponse {
     pub ok: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiSeverity {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiAnomalyKind {
+    SpendSpike,
+    OutputPoisoning,
+    ExpensiveCall,
+    NewDomain,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AiAnomaly {
+    pub kind: AiAnomalyKind,
+    pub severity: AiSeverity,
+    pub message: String,
+    pub receipt_id: Option<i64>,
+    pub ts_rfc3339: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiAnomaliesResponse {
+    pub anomalies: Vec<AiAnomaly>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BudgetRecord {
     pub category: String,

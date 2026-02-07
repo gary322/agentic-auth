@@ -1458,17 +1458,6 @@ impl Db {
         Ok(())
     }
 
-    pub async fn create_approval(
-        &self,
-        tool_id: &str,
-        reason: &str,
-        kind: ApprovalKind,
-        args: &serde_json::Value,
-    ) -> anyhow::Result<ApprovalRequest> {
-        self.create_approval_with_summary(tool_id, reason, kind, args, None)
-            .await
-    }
-
     pub async fn create_approval_with_summary(
         &self,
         tool_id: &str,

@@ -118,6 +118,10 @@ export interface paths {
     /** Approve an approval request (signer-authenticated) */
     post: operations["signerApprove"];
   };
+  "/v1/ai/anomalies": {
+    /** List non-authoritative AI anomalies (alerts) */
+    get: operations["listAiAnomalies"];
+  };
   "/v1/receipts": {
     /** List receipts */
     get: operations["listReceipts"];
@@ -445,6 +449,22 @@ export interface components {
     };
     ListReceiptsResponse: {
       receipts: components["schemas"]["ReceiptRecord"][];
+    };
+    /** @enum {string} */
+    AiSeverity: "low" | "medium" | "high";
+    /** @enum {string} */
+    AiAnomalyKind: "spend_spike" | "output_poisoning" | "expensive_call" | "new_domain";
+    AiAnomaly: {
+      kind: components["schemas"]["AiAnomalyKind"];
+      severity: components["schemas"]["AiSeverity"];
+      message: string;
+      /** Format: int64 */
+      receipt_id: number | null;
+      /** Format: date-time */
+      ts_rfc3339: string | null;
+    };
+    AiAnomaliesResponse: {
+      anomalies: components["schemas"]["AiAnomaly"][];
     };
   };
   responses: never;
@@ -1103,6 +1123,28 @@ export interface operations {
       };
       /** @description bad request */
       400: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+    };
+  };
+  /** List non-authoritative AI anomalies (alerts) */
+  listAiAnomalies: {
+    parameters: {
+      query?: {
+        limit?: number;
+      };
+    };
+    responses: {
+      /** @description ok */
+      200: {
+        content: {
+          "application/json": components["schemas"]["AiAnomaliesResponse"];
+        };
+      };
+      /** @description unauthorized */
+      401: {
         content: {
           "application/json": components["schemas"]["ErrorResponse"];
         };

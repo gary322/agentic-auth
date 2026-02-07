@@ -699,6 +699,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "url",
 ]
 
 [[package]]
@@ -1002,6 +1003,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "briefcase-ai",
  "briefcase-api",
  "briefcase-core",
  "briefcase-dpop",

@@ -30,6 +30,7 @@ const ALLOWED_RPC_METHODS = new Set([
   "approve",
   "list_receipts",
   "verify_receipts",
+  "ai_anomalies",
 ]);
 
 function parseOAuthRedirectUrl(urlStr: string): { code: string; state: string } {

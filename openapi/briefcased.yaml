@@ -677,6 +677,40 @@ components:
           items:
             $ref: "#/components/schemas/ReceiptRecord"
 
+    AiSeverity:
+      type: string
+      enum: [low, medium, high]
+
+    AiAnomalyKind:
+      type: string
+      enum: [spend_spike, output_poisoning, expensive_call, new_domain]
+
+    AiAnomaly:
+      type: object
+      required: [kind, severity, message, receipt_id, ts_rfc3339]
+      properties:
+        kind:
+          $ref: "#/components/schemas/AiAnomalyKind"
+        severity:
+          $ref: "#/components/schemas/AiSeverity"
+        message:
+          type: string
+        receipt_id:
+          type: ["integer", "null"]
+          format: int64
+        ts_rfc3339:
+          type: ["string", "null"]
+          format: date-time
+
+    AiAnomaliesResponse:
+      type: object
+      required: [anomalies]
+      properties:
+        anomalies:
+          type: array
+          items:
+            $ref: "#/components/schemas/AiAnomaly"
+
 paths:
   /health:
     get:
@@ -1425,6 +1459,33 @@ paths:
                 $ref: "#/components/schemas/ApproveResponse"
         "400":
           description: bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/ai/anomalies:
+    get:
+      summary: List non-authoritative AI anomalies (alerts)
+      operationId: listAiAnomalies
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 200
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiAnomaliesResponse"
+        "401":
+          description: unauthorized
           content:
             application/json:
               schema:

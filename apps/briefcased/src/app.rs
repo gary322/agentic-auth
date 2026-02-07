@@ -10,19 +10,19 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
 use briefcase_api::types::{
-    ApproveResponse, BudgetRecord, CallToolRequest, CallToolResponse, DeleteMcpServerResponse,
-    DeleteProviderResponse, ErrorResponse, FetchVcResponse, IdentityResponse,
-    ListApprovalsResponse, ListBudgetsResponse, ListMcpServersResponse, ListProvidersResponse,
-    ListReceiptsResponse, ListToolsResponse, McpOAuthExchangeRequest, McpOAuthExchangeResponse,
-    McpOAuthStartRequest, McpOAuthStartResponse, OAuthExchangeRequest, OAuthExchangeResponse,
-    ProviderSummary, RevokeMcpOAuthResponse, RevokeProviderOAuthResponse, SetBudgetRequest,
-    SignerAlgorithm, SignerPairCompleteRequest, SignerPairCompleteResponse,
-    SignerPairStartResponse, SignerSignedRequest, UpsertMcpServerRequest, UpsertProviderRequest,
-    VerifyReceiptsResponse,
+    AiAnomaliesResponse, AiAnomaly, AiAnomalyKind, AiSeverity, ApproveResponse, BudgetRecord,
+    CallToolRequest, CallToolResponse, DeleteMcpServerResponse, DeleteProviderResponse,
+    ErrorResponse, FetchVcResponse, IdentityResponse, ListApprovalsResponse, ListBudgetsResponse,
+    ListMcpServersResponse, ListProvidersResponse, ListReceiptsResponse, ListToolsResponse,
+    McpOAuthExchangeRequest, McpOAuthExchangeResponse, McpOAuthStartRequest, McpOAuthStartResponse,
+    OAuthExchangeRequest, OAuthExchangeResponse, ProviderSummary, RevokeMcpOAuthResponse,
+    RevokeProviderOAuthResponse, SetBudgetRequest, SignerAlgorithm, SignerPairCompleteRequest,
+    SignerPairCompleteResponse, SignerPairStartResponse, SignerSignedRequest,
+    UpsertMcpServerRequest, UpsertProviderRequest, VerifyReceiptsResponse,
 };
 use briefcase_core::{
     ApprovalKind, PolicyDecision, ToolCall, ToolEgressPolicy, ToolFilesystemPolicy, ToolLimits,
-    ToolManifest, ToolResult, ToolRuntimeKind,
+    ToolManifest, ToolResult, ToolRuntimeKind, util::sha256_hex,
 };
 use chrono::Utc;
 use rand::RngCore as _;
@@ -372,6 +372,7 @@ fn router(state: AppState) -> Router {
         .route("/v1/approvals/{id}/approve", post(approve))
         .route("/v1/signer/pair/start", post(start_signer_pairing))
         .route("/v1/receipts", get(list_receipts))
+        .route("/v1/ai/anomalies", get(list_ai_anomalies))
         .route("/v1/receipts/verify", post(verify_receipts))
         .layer(axum::middleware::from_fn_with_state(
             state.auth_token.clone(),
@@ -1145,6 +1146,8 @@ async fn preflight_vc_status_check(
     state: &AppState,
     call: &ToolCall,
     runtime: &str,
+    spec: &briefcase_core::ToolSpec,
+    policy_ctx: ToolPolicyContext,
 ) -> anyhow::Result<Option<CallToolResponse>> {
     if call.tool_id != "quote" {
         return Ok(None);
@@ -1177,6 +1180,8 @@ async fn preflight_vc_status_check(
                         state,
                         call,
                         runtime,
+                        spec,
+                        policy_ctx,
                         &provider_id,
                         "vc_status_bad_url",
                         &e.to_string(),
@@ -1191,6 +1196,8 @@ async fn preflight_vc_status_check(
                         state,
                         call,
                         runtime,
+                        spec,
+                        policy_ctx,
                         &provider_id,
                         "vc_status_bad_index",
                         "status_list_index out of range",
@@ -1212,6 +1219,8 @@ async fn preflight_vc_status_check(
                     state,
                     call,
                     runtime,
+                    spec,
+                    policy_ctx,
                     &provider_id,
                     "vc_status_parse_failed",
                     &e.to_string(),
@@ -1226,6 +1235,8 @@ async fn preflight_vc_status_check(
             state,
             call,
             runtime,
+            spec,
+            policy_ctx,
             &provider_id,
             "vc_status_insecure_url",
             &e.to_string(),
@@ -1241,6 +1252,8 @@ async fn preflight_vc_status_check(
                     state,
                     call,
                     runtime,
+                    spec,
+                    policy_ctx,
                     &provider_id,
                     "vc_status_fetch_failed",
                     &e.to_string(),
@@ -1254,6 +1267,8 @@ async fn preflight_vc_status_check(
             state,
             call,
             runtime,
+            spec,
+            policy_ctx,
             &provider_id,
             "vc_status_purpose_mismatch",
             "credentialStatus.statusPurpose does not match status list",
@@ -1269,6 +1284,8 @@ async fn preflight_vc_status_check(
                     state,
                     call,
                     runtime,
+                    spec,
+                    policy_ctx,
                     &provider_id,
                     "vc_status_decode_failed",
                     &e.to_string(),
@@ -1288,6 +1305,8 @@ async fn preflight_vc_status_check(
                 state,
                 call,
                 runtime,
+                spec,
+                policy_ctx,
                 &provider_id,
                 "vc_status_index_out_of_range",
                 &e.to_string(),
@@ -1326,10 +1345,13 @@ async fn preflight_vc_status_check(
     Ok(None)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_unknown_vc_status(
     state: &AppState,
     call: &ToolCall,
     runtime: &str,
+    spec: &briefcase_core::ToolSpec,
+    policy_ctx: ToolPolicyContext,
     provider_id: &str,
     code: &str,
     detail: &str,
@@ -1373,13 +1395,22 @@ async fn handle_unknown_vc_status(
                 return Ok(None);
             }
 
+            let summary = approval_summary_for_tool_call(
+                &call.tool_id,
+                spec,
+                policy_ctx,
+                "vc_status_unknown",
+                ApprovalKind::Local,
+                &call.args,
+            );
             let approval = state
                 .db
-                .create_approval(
+                .create_approval_with_summary(
                     &call.tool_id,
                     "vc_status_unknown",
                     ApprovalKind::Local,
                     &call.args,
+                    Some(summary),
                 )
                 .await?;
 
@@ -1542,6 +1573,52 @@ fn validate_https_or_loopback_url(u: &url::Url) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn approval_kind_str(kind: ApprovalKind) -> &'static str {
+    match kind {
+        ApprovalKind::Local => "local",
+        ApprovalKind::MobileSigner => "mobile_signer",
+    }
+}
+
+fn approval_summary_for_tool_call(
+    tool_id: &str,
+    spec: &briefcase_core::ToolSpec,
+    policy_ctx: ToolPolicyContext,
+    reason: &str,
+    kind: ApprovalKind,
+    args: &serde_json::Value,
+) -> serde_json::Value {
+    let estimated_cost_usd = if spec.cost.estimated_usd > 0.0 {
+        Some(spec.cost.estimated_usd)
+    } else {
+        None
+    };
+
+    let copilot_summary =
+        briefcase_ai::copilot_summary_for_approval(&briefcase_ai::CopilotApprovalSummaryInput {
+            tool_id: tool_id.to_string(),
+            category: spec.category.as_str().to_string(),
+            reason: reason.to_string(),
+            approval_kind: approval_kind_str(kind).to_string(),
+            net_access: policy_ctx.net_access,
+            fs_access: policy_ctx.fs_access,
+            estimated_cost_usd,
+        });
+
+    let args_hash = sha256_hex(serde_json::to_vec(args).expect("serialize args").as_slice());
+    serde_json::json!({
+        "tool_id": tool_id,
+        "reason": reason,
+        "kind": approval_kind_str(kind),
+        "category": spec.category.as_str(),
+        "net_access": policy_ctx.net_access,
+        "fs_access": policy_ctx.fs_access,
+        "estimated_cost_usd": estimated_cost_usd,
+        "args_hash": args_hash,
+        "copilot_summary": copilot_summary,
+    })
+}
+
 async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<CallToolResponse> {
     enum ResolvedTool {
         Local(Arc<crate::tools::ToolRuntime>),
@@ -1659,9 +1736,23 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
         PolicyDecision::RequireApproval { reason, kind } => {
             // If the user already attached an approval token, proceed.
             if call.approval_token.is_none() {
+                let summary = approval_summary_for_tool_call(
+                    &call.tool_id,
+                    spec,
+                    policy_ctx,
+                    reason,
+                    *kind,
+                    &call.args,
+                );
                 let approval = state
                     .db
-                    .create_approval(&call.tool_id, reason, *kind, &call.args)
+                    .create_approval_with_summary(
+                        &call.tool_id,
+                        reason,
+                        *kind,
+                        &call.args,
+                        Some(summary),
+                    )
                     .await?;
 
                 state
@@ -1696,9 +1787,23 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
                 reason.truncate(160);
             }
 
+            let summary = approval_summary_for_tool_call(
+                &call.tool_id,
+                spec,
+                policy_ctx,
+                &reason,
+                ApprovalKind::Local,
+                &call.args,
+            );
             let approval = state
                 .db
-                .create_approval(&call.tool_id, &reason, ApprovalKind::Local, &call.args)
+                .create_approval_with_summary(
+                    &call.tool_id,
+                    &reason,
+                    ApprovalKind::Local,
+                    &call.args,
+                    Some(summary),
+                )
                 .await?;
 
             state
@@ -1728,13 +1833,22 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
             .await?
         && call.approval_token.is_none()
     {
+        let summary = approval_summary_for_tool_call(
+            &call.tool_id,
+            spec,
+            policy_ctx,
+            "budget_exceeded",
+            ApprovalKind::Local,
+            &call.args,
+        );
         let approval = state
             .db
-            .create_approval(
+            .create_approval_with_summary(
                 &call.tool_id,
                 "budget_exceeded",
                 ApprovalKind::Local,
                 &call.args,
+                Some(summary),
             )
             .await?;
 
@@ -1755,7 +1869,9 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
         return Ok(CallToolResponse::ApprovalRequired { approval });
     }
 
-    if let Some(resp) = preflight_vc_status_check(state, &call, runtime.as_str()).await? {
+    if let Some(resp) =
+        preflight_vc_status_check(state, &call, runtime.as_str(), spec, policy_ctx).await?
+    {
         return Ok(resp);
     }
 
@@ -1796,6 +1912,18 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
                     .await?;
             }
 
+            let content = match &tool {
+                ResolvedTool::Local(t) => t.apply_output_firewall(content),
+                ResolvedTool::Remote(s) => {
+                    crate::firewall::apply_output_firewall(&s.output_firewall, content)
+                }
+            };
+
+            // Output poisoning detection (non-authoritative): record signals/domains but not raw content.
+            let output_analysis = briefcase_ai::analyze_tool_output(&content);
+            let output_signals = output_analysis.signals;
+            let output_domains = output_analysis.domains;
+
             let receipt = state
                 .receipts
                 .append(serde_json::json!({
@@ -1806,16 +1934,11 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
                     "auth_method": auth_method,
                     "cost_usd": cost_usd_opt,
                     "source": source.as_str(),
+                    "output_signals": output_signals,
+                    "output_domains": output_domains,
                     "ts": Utc::now().to_rfc3339(),
                 }))
                 .await?;
-
-            let content = match &tool {
-                ResolvedTool::Local(t) => t.apply_output_firewall(content),
-                ResolvedTool::Remote(s) => {
-                    crate::firewall::apply_output_firewall(&s.output_firewall, content)
-                }
-            };
 
             let result = ToolResult {
                 content,
@@ -2334,6 +2457,46 @@ async fn list_receipts(
     let offset = q.offset.unwrap_or(0);
     let receipts = state.receipts.list(limit, offset).await.unwrap_or_default();
     Json(ListReceiptsResponse { receipts })
+}
+
+#[derive(Debug, Deserialize)]
+struct ListAiAnomaliesQuery {
+    limit: Option<usize>,
+}
+
+async fn list_ai_anomalies(
+    State(state): State<AppState>,
+    Query(q): Query<ListAiAnomaliesQuery>,
+) -> Result<Json<AiAnomaliesResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let limit = q.limit.unwrap_or(200).min(1000);
+    let mut receipts = state
+        .receipts
+        .list(limit, 0)
+        .await
+        .map_err(internal_error)?;
+    // `briefcase_ai::detect_anomalies` expects receipts oldest-first for "new domain" detection.
+    receipts.reverse();
+    let anomalies = briefcase_ai::detect_anomalies(&receipts)
+        .into_iter()
+        .map(|a| AiAnomaly {
+            kind: match a.kind {
+                briefcase_ai::AiAnomalyKind::SpendSpike => AiAnomalyKind::SpendSpike,
+                briefcase_ai::AiAnomalyKind::OutputPoisoning => AiAnomalyKind::OutputPoisoning,
+                briefcase_ai::AiAnomalyKind::ExpensiveCall => AiAnomalyKind::ExpensiveCall,
+                briefcase_ai::AiAnomalyKind::NewDomain => AiAnomalyKind::NewDomain,
+            },
+            severity: match a.severity {
+                briefcase_ai::AiSeverity::Low => AiSeverity::Low,
+                briefcase_ai::AiSeverity::Medium => AiSeverity::Medium,
+                briefcase_ai::AiSeverity::High => AiSeverity::High,
+            },
+            message: a.message,
+            receipt_id: a.receipt_id,
+            ts_rfc3339: a.ts_rfc3339,
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Json(AiAnomaliesResponse { anomalies }))
 }
 
 async fn verify_receipts(
@@ -3841,10 +4004,21 @@ mod tests {
             })
             .await?;
 
-        let approval_id = match resp {
-            CallToolResponse::ApprovalRequired { approval } => approval.id,
+        let approval = match resp {
+            CallToolResponse::ApprovalRequired { approval } => approval,
             _ => anyhow::bail!("expected approval_required"),
         };
+        let approval_id = approval.id;
+        let copilot = approval
+            .summary
+            .get("copilot_summary")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            copilot.contains("note_add"),
+            "missing copilot_summary in approval: {}",
+            approval.summary
+        );
 
         let approved = client.approve(&approval_id).await?;
 
@@ -5231,6 +5405,79 @@ mod tests {
 
         daemon_task.abort();
         secure_task.abort();
+        provider_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ai_anomalies_endpoint_reports_output_poisoning_and_new_domain() -> anyhow::Result<()> {
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let (state, _daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
+
+        // Seed a few receipts directly; the daemon should surface anomalies derived from receipts.
+        state
+            .receipts
+            .append(serde_json::json!({
+                "kind": "tool_call",
+                "tool_id": "echo",
+                "runtime": "builtin",
+                "decision": "allow",
+                "cost_usd": 3.0,
+                "source": "local:test",
+                "output_signals": ["prompt_injection_signals"],
+                "output_domains": ["example.com"],
+                "ts": Utc::now().to_rfc3339(),
+            }))
+            .await?;
+        state
+            .receipts
+            .append(serde_json::json!({
+                "kind": "tool_call",
+                "tool_id": "echo",
+                "runtime": "builtin",
+                "decision": "allow",
+                "cost_usd": 3.0,
+                "source": "local:test",
+                "output_signals": [],
+                "output_domains": [],
+                "ts": Utc::now().to_rfc3339(),
+            }))
+            .await?;
+
+        let out = client.ai_anomalies(200).await?;
+        assert!(
+            out.anomalies
+                .iter()
+                .any(|a| a.kind == briefcase_api::types::AiAnomalyKind::OutputPoisoning),
+            "expected output_poisoning anomaly: {:?}",
+            out.anomalies
+        );
+        assert!(
+            out.anomalies
+                .iter()
+                .any(|a| a.kind == briefcase_api::types::AiAnomalyKind::NewDomain
+                    && a.message.contains("example.com")),
+            "expected new_domain anomaly: {:?}",
+            out.anomalies
+        );
+        assert!(
+            out.anomalies
+                .iter()
+                .any(|a| a.kind == briefcase_api::types::AiAnomalyKind::SpendSpike),
+            "expected spend_spike anomaly: {:?}",
+            out.anomalies
+        );
+        assert!(
+            out.anomalies
+                .iter()
+                .any(|a| a.kind == briefcase_api::types::AiAnomalyKind::ExpensiveCall),
+            "expected expensive_call anomaly: {:?}",
+            out.anomalies
+        );
+
+        daemon_task.abort();
         provider_task.abort();
         Ok(())
     }

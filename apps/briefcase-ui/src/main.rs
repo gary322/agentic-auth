@@ -102,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/approvals", get(api_approvals))
         .route("/api/approvals/{id}/approve", post(api_approve))
         .route("/api/receipts", get(api_receipts))
+        .route("/api/anomalies", get(api_anomalies))
         .layer(TraceLayer::new_for_http())
         // DNS rebinding defense: if a hostile site can cause a browser to treat it as the UI
         // origin (by rebinding to 127.0.0.1), they could read the CSRF token and issue writes.
@@ -270,9 +271,22 @@ async fn index(State(st): State<AppState>) -> Html<String> {
         </div>
         <div id="approvalsErr" class="err"></div>
         <table>
-          <thead><tr><th>ID</th><th>Tool</th><th>Reason</th><th>Kind</th><th>Expires</th><th></th></tr></thead>
+          <thead><tr><th>ID</th><th>Tool</th><th>Reason</th><th>Summary</th><th>Kind</th><th>Expires</th><th></th></tr></thead>
           <tbody id="approvalsBody"></tbody>
         </table>
+      </section>
+
+      <section class="card">
+        <div class="row">
+          <h2>Alerts (AI)</h2>
+          <button id="refreshAlertsBtn">Refresh</button>
+        </div>
+        <div id="alertsErr" class="err"></div>
+        <table>
+          <thead><tr><th>Severity</th><th>Kind</th><th>Message</th><th>Receipt</th><th class="mono">TS</th></tr></thead>
+          <tbody id="alertsBody"></tbody>
+        </table>
+        <div class="muted">Non-authoritative signals based on recent receipts.</div>
       </section>
 
       <section class="card">
@@ -353,6 +367,9 @@ async fn index(State(st): State<AppState>) -> Html<String> {
           const v = await getJson('/api/approvals');
           for (const a of v.approvals) {{
             const tr = document.createElement('tr');
+            const summary = (a.summary && typeof a.summary === 'object' && typeof a.summary.copilot_summary === 'string')
+              ? a.summary.copilot_summary
+              : '';
             const btn = document.createElement('button');
             const needsSigner = a.kind === 'mobile_signer';
             btn.textContent = needsSigner ? 'Mobile signer required' : 'Approve';
@@ -374,15 +391,39 @@ async fn index(State(st): State<AppState>) -> Html<String> {
               <td class="mono">${{a.id}}</td>
               <td>${{a.tool_id}}</td>
               <td class="muted">${{a.reason}}</td>
+              <td class="mono muted" data-copilot></td>
               <td><span class="pill ${{a.kind === 'local' ? 'ok' : 'no'}}">${{a.kind}}</span></td>
               <td class="mono">${{a.expires_at}}</td>
               <td></td>
             `;
-            tr.children[5].appendChild(btn);
+            tr.querySelector('[data-copilot]').textContent = summary;
+            tr.children[6].appendChild(btn);
             qs('#approvalsBody').appendChild(tr);
           }}
         }} catch (e) {{
           qs('#approvalsErr').textContent = e.toString();
+        }}
+      }}
+
+      async function loadAlerts() {{
+        qs('#alertsErr').textContent = '';
+        qs('#alertsBody').innerHTML = '';
+        try {{
+          const v = await getJson('/api/anomalies');
+          for (const a of v.anomalies) {{
+            const tr = document.createElement('tr');
+            const sevClass = a.severity === 'high' ? 'no' : 'ok';
+            tr.innerHTML = `
+              <td><span class="pill ${{sevClass}}">${{a.severity}}</span></td>
+              <td class="muted">${{a.kind}}</td>
+              <td>${{a.message}}</td>
+              <td class="mono">${{a.receipt_id ?? '-'}}</td>
+              <td class="mono">${{a.ts_rfc3339 ?? '-'}}</td>
+            `;
+            qs('#alertsBody').appendChild(tr);
+          }}
+        }} catch (e) {{
+          qs('#alertsErr').textContent = e.toString();
         }}
       }}
 
@@ -409,11 +450,13 @@ async fn index(State(st): State<AppState>) -> Html<String> {
 
       qs('#refreshBtn').onclick = loadProviders;
       qs('#refreshApprovalsBtn').onclick = loadApprovals;
+      qs('#refreshAlertsBtn').onclick = loadAlerts;
       qs('#refreshReceiptsBtn').onclick = loadReceipts;
 
       loadIdentity();
       loadProviders();
       loadApprovals();
+      loadAlerts();
       loadReceipts();
     </script>
   </body>
@@ -451,6 +494,15 @@ async fn api_approve(
 
 async fn api_receipts(State(st): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     let v = st.client.list_receipts().await.map_err(ApiError::daemon)?;
+    Ok(Json(serde_json::to_value(v).map_err(ApiError::internal)?))
+}
+
+async fn api_anomalies(State(st): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let v = st
+        .client
+        .ai_anomalies(200)
+        .await
+        .map_err(ApiError::daemon)?;
     Ok(Json(serde_json::to_value(v).map_err(ApiError::internal)?))
 }
 
