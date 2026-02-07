@@ -30,7 +30,10 @@ jobs:
           # Currently transitively pulled in via `keyring` on Linux (secret-service/zbus).
           # We track these, but do not block CI on "unmaintained" advisories.
           # NOTE: `audit-check` parses this as a comma-separated list.
-          ignore: RUSTSEC-2024-0388, RUSTSEC-2024-0384
+          # Also ignore the `rsa` Marvin-attack advisory which is pulled in transitively via
+          # SQLx's MySQL driver, even though this repo only uses Postgres at runtime.
+          # There is no fixed upgrade available as of 2026-02-07.
+          ignore: RUSTSEC-2024-0388, RUSTSEC-2024-0384, RUSTSEC-2023-0071
 
   fuzz:
     name: fuzz (scheduled)
