@@ -137,9 +137,10 @@ run_and_capture() {
 
 wait_for_health() {
   local url="$1"
-  local tries="${2:-60}"
+  # CI runners can take a while to compile the provider gateway before it starts responding.
+  local tries="${2:-240}"
   for _ in $(seq 1 "${tries}"); do
-    if curl -fsS "${url}" >/dev/null 2>&1; then
+    if curl -fsS --connect-timeout 2 --max-time 3 "${url}" >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
@@ -172,6 +173,7 @@ run_and_capture docs_profile_consistency "${CARGO_BIN}" test -p briefcase-core -
 # NOTE: For CI/release this uses a fixed local address; override via --aag-addr if needed.
 AAG_BASE_URL="http://${AAG_ADDR}"
 AAG_PID=""
+TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 
 cleanup() {
   if [[ -n "${AAG_PID}" ]]; then
@@ -183,16 +185,24 @@ trap cleanup EXIT
 
 {
   echo "starting local agent-access-gateway at ${AAG_BASE_URL}"
+  # Build first to avoid the health check racing a cold `cargo run` compile on CI runners.
+  run_and_capture agent_access_gateway_build "${CARGO_BIN}" build -p agent-access-gateway
+
+  AAG_BIN="${TARGET_DIR}/debug/agent-access-gateway"
+  if [[ ! -x "${AAG_BIN}" ]]; then
+    echo "ERROR: expected agent-access-gateway binary at ${AAG_BIN}" >&2
+    exit 1
+  fi
+
   # "test-secret" is used only for local conformance and is not printed elsewhere.
   AAG_SECRET="test-secret" \
     RUST_LOG="info,hyper=warn,reqwest=warn" \
-    "${CARGO_BIN}" run -q -p agent-access-gateway -- --addr "${AAG_ADDR}" \
+    "${AAG_BIN}" --addr "${AAG_ADDR}" \
     >"${LOG_DIR}/agent-access-gateway.out" 2>&1 &
   AAG_PID="$!"
 
-  if ! wait_for_health "${AAG_BASE_URL}/health" 60; then
-    echo "agent-access-gateway failed health check" >&2
-    tail -n 200 "${LOG_DIR}/agent-access-gateway.out" || true
+  if ! wait_for_health "${AAG_BASE_URL}/health"; then
+    echo "agent-access-gateway failed health check; see ${LOG_DIR}/agent-access-gateway.out" >&2
     exit 1
   fi
 } >"${LOG_DIR}/provider_contract_bootstrap.out" 2>&1
